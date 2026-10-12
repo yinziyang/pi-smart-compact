@@ -129,3 +129,31 @@ test("模型输出模式：被裁剪得不再包含完整凭据的条目整条�
 	const forged = `## Goal\nx\n${text.replace("## 最近失败", "- [v1] 任意假命令 → 退出码 0\n## 最近失败")}`;
 	assert.notDeepEqual(validateModelPack(forged, expected), []);
 });
+
+test("验证命令很多时最近失败仍被收录，截断后保留首行锚点与原文尾部", () => {
+	const d: PackData = {
+		verify: Array.from({ length: 200 }, (_, i) => ({ cmd: `go test ./pkg${i}/...`, status: "退出码 0" })),
+		failures: Array.from({ length: 3 }, (_, i) => ({ tool: "bash", entryId: `f${i}`, tail: `${"前面的输出\n".repeat(200)}最后的报错 ${i}`, anchor: `最后的报错 ${i}` })),
+		users: [],
+		skills: [],
+		modified: [],
+		read: [],
+	};
+	const t = renderLocal(d, 9000, 27000);
+	for (let i = 0; i < 3; i++) {
+		assert.ok(t.includes(`[e${i + 1}] bash（entryId=f${i}）锚点：最后的报错 ${i}`), `失败 ${i} 的首行`);
+		assert.ok(t.includes(`${ESCAPE}最后的报错 ${i}`) || t.includes(`最后的报错 ${i}\n`), `失败 ${i} 的尾部`);
+	}
+	assert.ok(t.includes("[v1]"), "验证记录仍有收录");
+	const m = renderModelData(d, 9000);
+	assert.ok(m.expected.some((e) => e.id === "e1") && m.expected.some((e) => e.id === "v1"));
+});
+
+test("用户原话额度不够时，最早的一条（任务原始需求）优先保留，渲染仍按时间倒序", () => {
+	const users = Array.from({ length: 30 }, (_, i) => ({ entryId: `u${30 - i}`, text: `第 ${30 - i} 条消息 ${"字".repeat(600)}` }));
+	const d: PackData = { verify: [], failures: [], users, skills: [], modified: [], read: [] };
+	const t = renderLocal(d, 4000, 12000);
+	assert.ok(t.includes("entryId=u1\n"), "最早的一条被保留");
+	assert.ok(t.includes("entryId=u30\n"), "最近的一条被保留");
+	assert.ok(t.indexOf("entryId=u30\n") < t.indexOf("entryId=u1\n"), "渲染按时间倒序");
+});

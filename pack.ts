@@ -245,15 +245,25 @@ function render(list: readonly Item[], data: PackData): string {
 	return parts.join("\n");
 }
 
+/** 截断条目文本：保留首行（编号、工具名、锚点），其余部分保留尾部，因为报错与结论通常在末尾。 */
+function keepHeadLineAndTail(text: string, tokens: number): string {
+	const nl = text.indexOf("\n");
+	if (nl < 0) return sliceByEst(text, tokens);
+	const head = text.slice(0, nl);
+	const rest = sliceByEst(text.slice(nl + 1), Math.max(0, tokens - estC(head) - 1), true);
+	return rest ? `${head}\n${rest.startsWith(ESCAPE) ? rest : `${ESCAPE}${rest}`}` : head;
+}
+
 /**
  * 按 estC 目标 Pt 选取条目：验证与失败合计不超过 25%，用户原话不超过 55%，其余各节共用剩下的部分，未用额度依次让给后面的节（方案 7.2）。
  * 交接与召回一节总是保留，它的额度先从 Pt 中扣除。单个条目放不下时截断它的文本。
+ * 第一组里最近失败先选，最多占组内额度的 60% 并按条数平分，剩下的给验证记录：验证命令很多的会话里，按顺序先放验证记录会把失败全部挤掉（回放评测实测）。
  */
 function selectByEst(all: readonly Item[], data: PackData, Pt: number): Item[] {
 	const fixed = estC(render([], data));
 	let left = Math.max(0, Pt - fixed);
 	const groups: { sections: number[]; share: number }[] = [
-		{ sections: [0, 1], share: 0.25 },
+		{ sections: [1, 0], share: 0.25 },
 		{ sections: [2], share: 0.55 },
 		{ sections: [3, 4], share: 1 },
 	];
@@ -262,22 +272,47 @@ function selectByEst(all: readonly Item[], data: PackData, Pt: number): Item[] {
 	for (const g of groups) {
 		let room = Math.min(left, Math.floor(g.share * Math.max(0, Pt - fixed)) + carry);
 		const spentBefore = room;
-		for (const it of all) {
-			if (!g.sections.includes(it.section)) continue;
-			const cost = estC(it.text) + 1;
-			if (cost <= room) {
-				chosen.push(it);
-				room -= cost;
-			} else if (room > 40 && it.section !== 4) {
-				chosen.push({ ...it, text: sliceByEst(it.text, room - 2) });
-				room = 0;
+		const failures = all.filter((it) => it.section === 1);
+		const failEach = failures.length ? Math.floor((0.6 * room) / failures.length) : 0;
+		for (const sec of g.sections) {
+			for (const it of priorityOrder(all, sec)) {
+				const cost = estC(it.text) + 1;
+				if (sec === 1) {
+					const text = cost <= failEach ? it.text : keepHeadLineAndTail(it.text, failEach - 2);
+					if (failEach > 40) {
+						chosen.push({ ...it, text });
+						room -= estC(text) + 1;
+					}
+				} else if (cost <= room) {
+					chosen.push(it);
+					room -= cost;
+				} else if (room > 40 && it.section !== 4) {
+					chosen.push({ ...it, text: sliceByEst(it.text, room - 2) });
+					room = 0;
+				}
 			}
 		}
 		left -= spentBefore - room;
 		carry = room;
 	}
-	// 各组按小节顺序处理，组内按输入顺序，所以 chosen 已经是渲染顺序。
-	return chosen;
+	// 恢复输入顺序：render 按小节输出，节内按这里的顺序。
+	const pos = new Map(all.map((it, i) => [it, i]));
+	return chosen.sort((a, b) => (pos.get(original(all, a)) ?? 0) - (pos.get(original(all, b)) ?? 0));
+}
+
+/**
+ * 某一节条目的选取顺序。用户原话按时间倒序排列，但最早的一条（通常是任务的原始需求与约束）排在第一位优先保证收录：
+ * 只按倒序选取时，额度不够会最先挤掉它（回放评测实测，关键约束因此遗漏）。
+ */
+function priorityOrder(all: readonly Item[], sec: number): Item[] {
+	const items = all.filter((it) => it.section === sec);
+	if (sec !== 2 || items.length < 2) return items;
+	return [items[items.length - 1], ...items.slice(0, -1)];
+}
+
+/** 截断后的条目对应的原条目（按编号与小节匹配；无编号的条目按文本匹配）。 */
+function original(all: readonly Item[], it: Item): Item {
+	return all.find((x) => x.section === it.section && (it.id !== null ? x.id === it.id : x.text === it.text)) ?? it;
 }
 
 /** 只在 UTF-8 code point 边界截断到不超过 maxBytes 字节。 */
