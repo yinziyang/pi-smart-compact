@@ -13,9 +13,15 @@ pi 的状态感知压缩扩展。
 
 必须通过 `settings.json` 的 `packages` 安装，pi-subagents 的子会话才会加载它；用 `-e` 临时加载时子会话不加载。
 
+pi 从本地路径加载包时不复制，直接读取原目录，所以要放在不会被系统清理的位置（不要用 `/tmp`）。
+本扩展运行时只依赖 pi 自带的包，不需要 `npm install`。
+
 ```bash
-pi install /path/to/pi-smart-compact
+git clone /tmp/pi-smart-compact ~/.pi/agent/.collab/smart-compact/pi-smart-compact
+pi install ~/.pi/agent/.collab/smart-compact/pi-smart-compact
 ```
+
+更新时在该目录执行 `git pull`，再重启 pi。
 
 同时在 `settings.json` 中打开 pi 的自动压缩，建议值如下：
 
