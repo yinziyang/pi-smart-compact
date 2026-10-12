@@ -19,7 +19,7 @@ import { handoffDir, handoffDoc, nextHandoffPath, removeHandoffsBefore, writeHan
 import { chooseModel, initialFEst, isVirtual, modelKey, requestFromEvent, runCompaction, virtualWindow, type OwnDetails } from "./compact.ts";
 import { applyEdits, contentText, findInvalidation, messageText, toolCalls, type RawEntry } from "./edits.ts";
 import { extractPack, type RecoveryRecord } from "./pack.ts";
-import { recallById, recallByQuery, validRecoveryRecords, type RecallDoc } from "./recall.ts";
+import { capRecall, recallById, recallByQuery, validRecoveryRecords, type RecallDoc } from "./recall.ts";
 import * as rec from "./recovery.ts";
 import { redact } from "./redact.ts";
 import { compactionSettingsFor, MAX_RECORDS, parseConfig, restoreState, STATE_TYPE, freshState, type CompactionRecord, type Config, type PersistedState, type R5Reason } from "./state.ts";
@@ -434,9 +434,10 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		if (m.role !== "assistant") return;
 		const r = rt(ctx);
 		// 虚拟模型的声明窗口校验（方案 7.2）。
-		if (r.declaredWindow !== null && ctx.model && isVirtual(ctx.model) && m.provider && m.model && m.stopReason !== "error" && m.stopReason !== "aborted") {
+		// 失败或中止的响应只要带着物理模型字段也要校验（方案 S8）；路由失败的响应仍记着虚拟模型，find 得到虚拟模型时跳过。
+		if (r.declaredWindow !== null && ctx.model && isVirtual(ctx.model) && m.provider && m.model) {
 			const phys = ctx.modelRegistry.find(m.provider, m.model);
-			if (phys && phys.contextWindow > 0 && phys.contextWindow < r.declaredWindow && !r.state.r5) {
+			if (phys && !isVirtual(phys) && phys.contextWindow > 0 && phys.contextWindow < r.declaredWindow && !r.state.r5) {
 				enterR5(ctx, r, "virtual");
 				ctx.abort();
 				return;
@@ -697,7 +698,7 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		annotations: { readOnlyHint: true },
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const docs = recallDocs(ctx);
-			const text = params.entryId ? (recallById(docs, params.entryId) ?? `找不到 entryId=${params.entryId}，或该记录已被删除。`) : recallByQuery(docs, params.query);
+			const text = capRecall(params.entryId ? (recallById(docs, params.entryId) ?? `找不到 entryId=${params.entryId}，或该记录已被删除。`) : recallByQuery(docs, params.query));
 			return { content: [{ type: "text", text }], details: undefined };
 		},
 	});

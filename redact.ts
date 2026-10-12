@@ -3,46 +3,78 @@
 
 const MASK = "[已脱敏]";
 
-/** 每条规则匹配一类密钥；键值类规则保留键名，只替换值。 */
-const RULES: { re: RegExp; keepGroup?: number }[] = [
-	{ re: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g },
-	{ re: /\bsk-[A-Za-z0-9_-]{16,}/g },
-	{ re: /\bgithub_pat_[A-Za-z0-9_]{20,}/g },
-	{ re: /\bghp_[A-Za-z0-9]{20,}/g },
-	{ re: /\bAKIA[0-9A-Z]{16}\b/g },
-	{ re: /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, keepGroup: 1 },
-	// password、secret、api_key 等键后面的任何赋值都视为秘密，只排除已脱敏的占位文本。
-	{ re: /(\b(?:password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|access[_-]?key|private[_-]?key)["']?\s*[:=]\s*["']?)(?!\[已脱敏\])[^\s"',;]{1,}/gi, keepGroup: 1 },
-	// token 一词常用于计量（「token: 8192」），只认像凭据的值：至少 16 个字符，或至少 6 个字符且同时含字母与数字，否则摘要会被反复判为不合格。
-	{ re: /(\b(?:token|auth[_-]?token|access[_-]?token|refresh[_-]?token)["']?\s*[:=]\s*["']?)(?!\[已脱敏\])(?:[^\s"',;]{16,}|(?=[^\s"',;]*\d)(?=[^\s"',;]*[A-Za-z])[^\s"',;]{6,})/gi, keepGroup: 1 },
-];
+/** 任何赋值都视为秘密的键。 */
+const SECRET_KEYS = "password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|access[_-]?key|private[_-]?key";
+/** token 一词常用于计量（「token: 8192」），这些键只认像凭据的值。 */
+const TOKEN_KEYS = "token|auth[_-]?token|access[_-]?token|refresh[_-]?token";
+const SECRET_KEY_RE = new RegExp(`^(?:${SECRET_KEYS})$`, "i");
+const TOKEN_KEY_RE = new RegExp(`^(?:${TOKEN_KEYS})$`, "i");
+
+/** 像凭据的值：至少 16 个字符，或至少 6 个字符且同时含字母与数字。 */
+function credentialLike(v: string): boolean {
+	return v.length >= 16 || (v.length >= 6 && /\d/.test(v) && /[A-Za-z]/.test(v));
+}
+
+/** 带格式的整段密钥，整段替换。 */
+const PATTERNS: RegExp[] = [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g, /\bsk-[A-Za-z0-9_-]{16,}/g, /\bgithub_pat_[A-Za-z0-9_]{20,}/g, /\bghp_[A-Za-z0-9]{20,}/g, /\bAKIA[0-9A-Z]{16}\b/g];
+
+const BEARER = /\b(Bearer\s+)([A-Za-z0-9._~+/=-]{8,})/gi;
+
+// 键值赋值：值是完整的双引号串、单引号串（允许转义），或到空白、逗号、分号为止的裸值。
+const VALUE = `("(?:[^"\\\\\\n]|\\\\.)*"|'(?:[^'\\\\\\n]|\\\\.)*'|[^\\s"',;]+)`;
+const SECRET_ASSIGN = new RegExp(`(\\b(?:${SECRET_KEYS})["']?\\s*[:=]\\s*)${VALUE}`, "gi");
+const TOKEN_ASSIGN = new RegExp(`(\\b(?:${TOKEN_KEYS})["']?\\s*[:=]\\s*)${VALUE}`, "gi");
+
+function unquote(v: string): { quote: string; inner: string } {
+	const q = v[0];
+	return (q === '"' || q === "'") && v.length >= 2 && v.endsWith(q) ? { quote: q, inner: v.slice(1, -1) } : { quote: "", inner: v };
+}
+
+/** 一个赋值值是否需要遮蔽；已经是占位文本的不算。 */
+function assignSecret(value: string, tokenKey: boolean): boolean {
+	const { inner } = unquote(value);
+	if (inner === MASK || inner === "") return false;
+	return tokenKey ? credentialLike(inner) : true;
+}
+
+function maskValue(value: string): string {
+	const { quote } = unquote(value);
+	return `${quote}${MASK}${quote}`;
+}
 
 /** 替换文本中的全部密钥。 */
 export function redact(s: string): string {
 	let out = s;
-	for (const { re, keepGroup } of RULES) {
-		out = out.replace(re, (...m: string[]) => (keepGroup ? `${m[keepGroup]}${MASK}` : MASK));
-	}
+	for (const re of PATTERNS) out = out.replace(re, MASK);
+	out = out.replace(BEARER, (_m, prefix: string) => `${prefix}${MASK}`);
+	out = out.replace(SECRET_ASSIGN, (m, prefix: string, value: string) => (assignSecret(value, false) ? `${prefix}${maskValue(value)}` : m));
+	out = out.replace(TOKEN_ASSIGN, (m, prefix: string, value: string) => (assignSecret(value, true) ? `${prefix}${maskValue(value)}` : m));
 	return out;
 }
 
 /** 文本中是否仍有匹配脱敏规则的内容。 */
 export function containsSecret(s: string): boolean {
-	return RULES.some(({ re }) => {
-		re.lastIndex = 0;
-		const hit = re.test(s);
-		re.lastIndex = 0;
-		return hit;
-	});
+	if (PATTERNS.some((re) => new RegExp(re.source, re.flags).test(s))) return true;
+	if (new RegExp(BEARER.source, BEARER.flags).test(s)) return true;
+	for (const m of s.matchAll(new RegExp(SECRET_ASSIGN.source, SECRET_ASSIGN.flags))) if (assignSecret(m[2], false)) return true;
+	for (const m of s.matchAll(new RegExp(TOKEN_ASSIGN.source, TOKEN_ASSIGN.flags))) if (assignSecret(m[2], true)) return true;
+	return false;
 }
 
-/** 深拷贝任意 JSON 值，并对其中每个字符串脱敏。 */
-export function redactDeep<T>(v: T): T {
-	if (typeof v === "string") return redact(v) as T;
+/**
+ * 深拷贝任意 JSON 值并脱敏：每个字符串按文本规则处理；对象中键名是敏感键的字符串值整体遮蔽（工具参数会被 pi 序列化成 `name(password="…")` 送进摘要请求）。
+ * token 类键只遮蔽像凭据的值。
+ */
+export function redactDeep<T>(v: T, key?: string): T {
+	if (typeof v === "string") {
+		if (key && SECRET_KEY_RE.test(key) && v !== MASK && v !== "") return MASK as T;
+		if (key && TOKEN_KEY_RE.test(key) && credentialLike(v)) return MASK as T;
+		return redact(v) as T;
+	}
 	if (Array.isArray(v)) return v.map((x) => redactDeep(x)) as T;
 	if (v && typeof v === "object") {
 		const out: Record<string, unknown> = {};
-		for (const [k, x] of Object.entries(v)) out[k] = redactDeep(x);
+		for (const [k, x] of Object.entries(v)) out[k] = redactDeep(x, k);
 		return out as T;
 	}
 	return v;

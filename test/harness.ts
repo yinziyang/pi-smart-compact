@@ -52,6 +52,10 @@ export interface RunOptions {
 	summary?: (n: number, req: Request) => AssistantMessage;
 	/** notes.md 的行数，决定每次读取带来的上下文增量。 */
 	noteLines?: number;
+	/** 额外的 faux 模型（第一个模型固定为 faux/m）。 */
+	extraModels?: { id: string; contextWindow: number; maxTokens: number }[];
+	/** 绑定扩展之后、执行步骤之前的准备，例如切换到虚拟模型。 */
+	setup?: (session: Session, runtime: ModelRuntime) => Promise<void>;
 }
 
 export interface RunResult {
@@ -113,7 +117,7 @@ export async function run(o: RunOptions): Promise<RunResult & { handoffTexts: st
 	const logs: string[] = [];
 	try {
 		const runtime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: null, refreshOnCreate: false });
-		const faux = fauxProvider({ provider: "faux", models: [{ id: "m", contextWindow: o.contextWindow ?? 60_000, maxTokens: 16_000 }] });
+		const faux = fauxProvider({ provider: "faux", models: [{ id: "m", contextWindow: o.contextWindow ?? 60_000, maxTokens: 16_000 }, ...(o.extraModels ?? [])] });
 		runtime.registerNativeProvider(faux.provider);
 		await runtime.refresh({ providers: ["faux"] });
 		for (let i = 0; i < 300 && !runtime.hasConfiguredAuth("faux"); i++) await new Promise((r) => setTimeout(r, 10));
@@ -138,6 +142,7 @@ export async function run(o: RunOptions): Promise<RunResult & { handoffTexts: st
 		await loader.reload();
 		const { session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model, resourceLoader: loader, sessionManager: SessionManager.create(cwd, sessionsDir) });
 		await session.bindExtensions({ mode: "print" });
+		await o.setup?.(session, runtime);
 		for (const step of o.steps) {
 			if (typeof step === "string") await session.prompt(step);
 			else await step(session);

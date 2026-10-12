@@ -39,6 +39,11 @@ function cap(s: string, max: number): string {
 	return s.length <= max ? s : `${s.slice(0, max - TRUNCATED.length)}${TRUNCATED}`;
 }
 
+/** 工具任何一次返回的最终裁剪，覆盖错误提示等全部分支（方案第 6 节）。 */
+export function capRecall(s: string): string {
+	return cap(s, MAX_TOTAL);
+}
+
 /** 按 entryId 取全文，最多 MAX_TOTAL 字符。找不到时返回 null。 */
 export function recallById(docs: readonly RecallDoc[], entryId: string): string | null {
 	const d = docs.find((x) => x.entryId === entryId);

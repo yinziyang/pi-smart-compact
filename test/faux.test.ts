@@ -244,3 +244,33 @@ test("脱敏：送给摘要模型的输入、交接文档与召回结果都不�
 	assert.match(out[0] ?? "", /已脱敏/);
 	assert.ok(!out[0]?.includes(key));
 });
+
+test("虚拟模型：声明窗口大于实际路由的物理窗口时，即使响应失败也进入 R5 并拦截后续输入", async () => {
+	const virtual: ExtensionFactory = (pi) => {
+		pi.registerVirtualModel({
+			provider: "v",
+			id: "auto",
+			name: "V Auto",
+			route(_req, ctx) {
+				const model = ctx.modelRegistry.find("faux", "small");
+				if (!model) throw new Error("找不到 faux/small");
+				return { model, thinkingLevel: "off" };
+			},
+		});
+	};
+	const r = await run({
+		steps: ["你好", "第二个问题"],
+		extraModels: [{ id: "small", contextWindow: 30_000, maxTokens: 8_000 }],
+		config: { virtualWindowTokens: { "v/auto": 60_000 } },
+		factories: [virtual],
+		setup: async (session, runtime) => {
+			const v = runtime.getModel("v", "auto");
+			if (!v) throw new Error("虚拟模型未注册");
+			await session.setModel(v);
+		},
+		chat: () => fauxAssistantMessage(fauxText(""), { stopReason: "error", errorMessage: "boom" }),
+	});
+	const state = r.entries.filter((e) => e.type === "custom" && e.customType === "smart-compact").at(-1);
+	assert.equal((state?.data as { r5?: { reason: string } }).r5?.reason, "virtual", r.logs.join(" | "));
+	assert.ok(!userTexts(r.entries).some((t) => t.includes("第二个问题")));
+});
