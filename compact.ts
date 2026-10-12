@@ -8,7 +8,7 @@ import type { Usage } from "@earendil-works/pi-ai";
 import type { ExtensionContext, SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
 import { computeBudget, estC, utf8Bytes, type Budget, type ModelState, type PackMode } from "./budget.ts";
 import { chooseCut, type CutEntry } from "./cut.ts";
-import { applyEdits, type RawEntry } from "./edits.ts";
+import { applyEdits, messageText, toolCalls, type RawEntry, type RawMessage } from "./edits.ts";
 import { summarize, type Generate, type SummaryStats } from "./narrative.ts";
 import { handoffDoc } from "./handoff.ts";
 import { extractPack, renderFull, renderLocal, renderModelData, truncateBytes, type RecoveryRecord } from "./pack.ts";
@@ -119,6 +119,19 @@ function serialize(msgs: AgentMessage[]): string {
 	return serializeConversation(convertToLlm(msgs));
 }
 
+/** 消息的完整文本：正文、思考、工具调用参数与工具结果全文，不做任何截断，用于估算原样保留的内容。 */
+export function fullText(msgs: readonly AgentMessage[]): string {
+	return msgs
+		.map((m) => {
+			const raw = m as unknown as RawMessage;
+			const blocks = Array.isArray(raw.content) ? raw.content : [];
+			const thinking = blocks.filter((b) => b.type === "thinking").map((b) => b.thinking ?? "");
+			const calls = toolCalls(raw).map((c) => `${c.name} ${JSON.stringify(c.args)}`);
+			return [messageText(raw), ...thinking, ...calls].join("\n");
+		})
+		.join("\n");
+}
+
 /** 初始固定开销：system prompt 加活动工具 schema 的估算（方案 7.3）。 */
 export function initialFEst(systemPrompt: string, tools: readonly { name: string; description?: string; promptGuidelines?: string[]; parameters?: unknown }[]): number {
 	return estC(systemPrompt) + tools.reduce((a, t) => a + estC(JSON.stringify({ n: t.name, d: t.description, g: t.promptGuidelines, p: t.parameters })), 0);
@@ -210,7 +223,8 @@ export async function runCompaction(input: CompactInput): Promise<CompactOutcome
 		.entries.filter((pe) => pe.sourceEntry.type !== "compaction")
 		.map((pe) => ({ id: pe.sourceEntry.id, messages: pe.messages.filter((m) => m.role !== "system") }))
 		.filter((pe) => pe.messages.length > 0);
-	const cutEntries: CutEntry[] = projected.map((pe) => ({ id: pe.id, roles: pe.messages.map((m) => m.role), est: estC(serialize(pe.messages), c) }));
+	// 保留区会原样发给模型，必须按完整内容估算；serializeConversation 会把工具结果截到 2000 字符（方案 F9），用它估算会严重低估读文件等大块结果。
+	const cutEntries: CutEntry[] = projected.map((pe) => ({ id: pe.id, roles: pe.messages.map((m) => m.role), est: estC(fullText(pe.messages), c) }));
 	const cut = chooseCut(cutEntries, budget.K, event.fallbackFirstKept);
 	const keptIds = new Set(cut ? projected.slice(cut.index).map((pe) => pe.id) : []);
 

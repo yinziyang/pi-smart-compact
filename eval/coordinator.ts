@@ -194,7 +194,7 @@ export async function withCoordinator<T>(
 		let stderr = "";
 		let pending = "";
 		const records: Record<string, unknown>[] = [];
-		const waiters: Array<{ pred: (r: Record<string, unknown>) => boolean; resolve: (r: Record<string, unknown>) => void; from: number }> = [];
+		const waiters: Array<{ pred: (r: Record<string, unknown>) => boolean; resolve: (r: Record<string, unknown>) => void; reject: (e: Error) => void; from: number }> = [];
 		const offer = () => {
 			for (let i = waiters.length - 1; i >= 0; i--) {
 				const w = waiters[i];
@@ -226,7 +226,11 @@ export async function withCoordinator<T>(
 		});
 		child.stderr?.on("data", (d) => (stderr += String(d)));
 		let childExited = false;
-		child.on("close", () => (childExited = true));
+		// 子进程退出后不会再有新记录，未满足的等待立即失败，驱动不再空等到各自的超时。
+		child.on("close", () => {
+			childExited = true;
+			for (const w of waiters.splice(0)) w.reject(new Error("子进程已退出"));
+		});
 		const io: RpcIo = {
 			records,
 			exited: () => childExited,
@@ -236,7 +240,8 @@ export async function withCoordinator<T>(
 					const hit = records.find(pred);
 					if (hit) return resolveWait(hit);
 					const timer = setTimeout(() => rejectWait(new Error(`等待 RPC 记录超时（${timeoutMs}ms）`)), timeoutMs);
-					waiters.push({ pred, from: 0, resolve: (r) => (clearTimeout(timer), resolveWait(r)) });
+					if (childExited) return rejectWait(new Error("子进程已退出"));
+					waiters.push({ pred, from: 0, resolve: (r) => (clearTimeout(timer), resolveWait(r)), reject: (e) => (clearTimeout(timer), rejectWait(e)) });
 				}),
 		};
 		let driveError: unknown;

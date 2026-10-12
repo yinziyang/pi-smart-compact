@@ -23,6 +23,13 @@ test("阈值压缩由本扩展接管：模型输出模式下摘要含完整压�
 	const summary = String(c.summary);
 	assert.ok(summary.includes("## Goal") && summary.includes(PACK_OPEN) && summary.includes(PACK_CLOSE));
 	assert.ok((d.stats as { requests: number }).requests >= 1);
+	// 保留区按完整内容估算：每次读文件约 1.5 万估算 token，K_eff 约 6000，保留区只带上最后一个读文件结果。
+	// 按截断后的序列化文本估算时（工具结果只算 2000 字符），保留区会带上十个左右。
+	const order = r.entries.filter((e) => e.type === "message" || e.type === "compaction");
+	const keptFrom = order.findIndex((e) => e.id === c.firstKeptEntryId);
+	const compIdx = order.indexOf(c);
+	const keptReads = order.slice(keptFrom, compIdx).filter((e) => (e.message as { role?: string } | undefined)?.role === "toolResult").length;
+	assert.ok(keptFrom >= 0 && keptReads <= 1, `保留区含 ${keptReads} 个工具结果`);
 	assert.ok(r.handoffs.length >= 1, "应写交接文档");
 	const last = r.entries.filter((e) => e.type === "message" && (e.message as { role?: string }).role === "assistant").at(-1);
 	assert.match(JSON.stringify(last?.message), /整理完成/);

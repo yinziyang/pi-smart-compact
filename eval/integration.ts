@@ -244,7 +244,7 @@ const CASES: CaseDef[] = [
 		window: 160_000,
 		packages: (root) => [ROOT, copyPiGoal(root)],
 		extraArgs: ["--tools", "read,write,recall_history"],
-		worst: worstFor(90, 160_000),
+		worst: worstFor(150, 160_000),
 		unobservableCalls: true,
 		async rpc(io, c) {
 			const list = c.docs.slice(0, 30);
