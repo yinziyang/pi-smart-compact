@@ -87,3 +87,20 @@ test("结构化工具参数按键名遮蔽，经 pi 序列化后摘要请求里�
 	assert.ok(!text.includes("abcdefghijklmnopqrstu"), text);
 	assert.match(text, /8192/);
 });
+
+test("跨行与未闭合的引号值同样遮蔽，检测与替换一致", () => {
+	assert.equal(redact('password="alpha\nbeta" ok'), 'password="[已脱敏]" ok');
+	assert.equal(redact('password="alpha beta\n下一行'), 'password="[已脱敏]\n下一行');
+	for (const s of ['password="alpha\nbeta"', 'password="alpha beta', "secret='unclosed value"]) {
+		assert.equal(containsSecret(s), true, s);
+		assert.equal(containsSecret(redact(s)), false, redact(s));
+	}
+});
+
+test("敏感键的非字符串值整体遮蔽，token 计量数字保留", () => {
+	const out = redactDeep({ password: 12345678, secret: ["alpha beta"], api_key: { value: "alpha beta" }, token: 8192, n: 1 });
+	assert.deepEqual(out, { password: "[已脱敏]", secret: "[已脱敏]", api_key: "[已脱敏]", token: 8192, n: 1 });
+	const msg = { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "login", arguments: { password: 12345678, secret: { v: "alpha beta" } } }], provider: "p", model: "m", api: "a", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, stopReason: "toolUse", timestamp: 0 };
+	const text = serializeConversation(convertToLlm([redactDeep(msg)] as never));
+	assert.ok(!text.includes("12345678") && !text.includes("alpha beta"), text);
+});

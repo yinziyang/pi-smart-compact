@@ -20,14 +20,19 @@ const PATTERNS: RegExp[] = [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:---
 
 const BEARER = /\b(Bearer\s+)([A-Za-z0-9._~+/=-]{8,})/gi;
 
-// 键值赋值：值是完整的双引号串、单引号串（允许转义），或到空白、逗号、分号为止的裸值。
-const VALUE = `("(?:[^"\\\\\\n]|\\\\.)*"|'(?:[^'\\\\\\n]|\\\\.)*'|[^\\s"',;]+)`;
+// 键值赋值的值，按顺序尝试：
+//   - 闭合的双引号或单引号串，允许转义与跨行。
+//   - 未闭合的引号串（例如被截断的输出），遮蔽到行尾，宁可多遮。
+//   - 到空白、逗号、分号为止的裸值。
+const VALUE = `("(?:[^"\\\\]|\\\\.)*"|'(?:[^'\\\\]|\\\\.)*'|"[^\\n]*|'[^\\n]*|[^\\s"',;]+)`;
 const SECRET_ASSIGN = new RegExp(`(\\b(?:${SECRET_KEYS})["']?\\s*[:=]\\s*)${VALUE}`, "gi");
 const TOKEN_ASSIGN = new RegExp(`(\\b(?:${TOKEN_KEYS})["']?\\s*[:=]\\s*)${VALUE}`, "gi");
 
 function unquote(v: string): { quote: string; inner: string } {
 	const q = v[0];
-	return (q === '"' || q === "'") && v.length >= 2 && v.endsWith(q) ? { quote: q, inner: v.slice(1, -1) } : { quote: "", inner: v };
+	if (q !== '"' && q !== "'") return { quote: "", inner: v };
+	const closed = v.length >= 2 && v.endsWith(q);
+	return { quote: q, inner: closed ? v.slice(1, -1) : v.slice(1) };
 }
 
 /** 一个赋值值是否需要遮蔽；已经是占位文本的不算。 */
@@ -39,7 +44,8 @@ function assignSecret(value: string, tokenKey: boolean): boolean {
 
 function maskValue(value: string): string {
 	const { quote } = unquote(value);
-	return `${quote}${MASK}${quote}`;
+	const closed = quote !== "" && value.length >= 2 && value.endsWith(quote);
+	return `${quote}${MASK}${closed ? quote : ""}`;
 }
 
 /** 替换文本中的全部密钥。 */
@@ -66,11 +72,10 @@ export function containsSecret(s: string): boolean {
  * token 类键只遮蔽像凭据的值。
  */
 export function redactDeep<T>(v: T, key?: string): T {
-	if (typeof v === "string") {
-		if (key && SECRET_KEY_RE.test(key) && v !== MASK && v !== "") return MASK as T;
-		if (key && TOKEN_KEY_RE.test(key) && credentialLike(v)) return MASK as T;
-		return redact(v) as T;
-	}
+	// 敏感键先于值类型判断：数字、数组、对象形式的秘密同样整体遮蔽，pi 会用 JSON.stringify 把它们写进摘要请求。
+	if (key && SECRET_KEY_RE.test(key) && v !== null && v !== undefined && v !== "" && v !== MASK) return MASK as T;
+	if (key && TOKEN_KEY_RE.test(key) && typeof v === "string" && credentialLike(v)) return MASK as T;
+	if (typeof v === "string") return redact(v) as T;
 	if (Array.isArray(v)) return v.map((x) => redactDeep(x)) as T;
 	if (v && typeof v === "object") {
 		const out: Record<string, unknown> = {};

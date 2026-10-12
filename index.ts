@@ -430,7 +430,14 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 	});
 
 	pi.on("message_end", (e, ctx) => {
-		const m = e.message as { role?: string; stopReason?: string; usage?: Record<string, unknown>; provider?: string; model?: string };
+		const m = e.message as { role?: string; stopReason?: string; usage?: Record<string, unknown>; provider?: string; model?: string; toolName?: string; content?: unknown };
+		// recall_history 的最终结果在落盘前统一脱敏并裁剪：pi 的参数校验错误会在 execute 之前生成并回显完整参数，绕过工具内部的处理（方案第 6 节）。
+		if (m.role === "toolResult" && m.toolName === "recall_history") {
+			const text = contentText(m.content);
+			const safe = capRecall(redact(text));
+			if (safe === text) return;
+			return { message: { ...(e.message as object), content: [{ type: "text", text: safe }] } as typeof e.message };
+		}
 		if (m.role !== "assistant") return;
 		const r = rt(ctx);
 		// 虚拟模型的声明窗口校验（方案 7.2）。
@@ -698,7 +705,7 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		annotations: { readOnlyHint: true },
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const docs = recallDocs(ctx);
-			const text = capRecall(params.entryId ? (recallById(docs, params.entryId) ?? `找不到 entryId=${params.entryId}，或该记录已被删除。`) : recallByQuery(docs, params.query));
+			const text = capRecall(redact(params.entryId ? (recallById(docs, params.entryId) ?? `找不到 entryId=${params.entryId}，或该记录已被删除。`) : recallByQuery(docs, params.query)));
 			return { content: [{ type: "text", text }], details: undefined };
 		},
 	});

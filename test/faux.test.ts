@@ -274,3 +274,19 @@ test("虚拟模型：声明窗口大于实际路由的物理窗口时，即使�
 	assert.equal((state?.data as { r5?: { reason: string } }).r5?.reason, "virtual", r.logs.join(" | "));
 	assert.ok(!userTexts(r.entries).some((t) => t.includes("第二个问题")));
 });
+
+test("recall_history 的参数校验错误与找不到条目的回显都经脱敏并限长", async () => {
+	const key = ["sk-", "abcdefghijklmnop1234"].join("");
+	const r = await run({
+		steps: ["试试召回"],
+		chat: (n) => {
+			if (n === 0) return fauxAssistantMessage(fauxToolCall("recall_history", { entryId: "x".repeat(20000) }), { stopReason: "toolUse" });
+			if (n === 1) return fauxAssistantMessage(fauxToolCall("recall_history", { query: "", entryId: key }), { stopReason: "toolUse" });
+			return say("完成");
+		},
+	});
+	const outs = r.entries.filter((e) => e.type === "message" && (e.message as { role?: string; toolName?: string }).role === "toolResult" && (e.message as { toolName?: string }).toolName === "recall_history").map((e) => (e.message as { content: { text: string }[] }).content.map((c) => c.text).join(""));
+	assert.equal(outs.length, 2);
+	assert.ok(outs[0].length <= 10000, String(outs[0].length));
+	assert.ok(!outs[1].includes(key));
+});
