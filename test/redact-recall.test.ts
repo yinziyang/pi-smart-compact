@@ -104,3 +104,10 @@ test("敏感键的非字符串值整体遮蔽，token 计量数字保留", () =>
 	const text = serializeConversation(convertToLlm([redactDeep(msg)] as never));
 	assert.ok(!text.includes("12345678") && !text.includes("alpha beta"), text);
 });
+
+test("反斜杠续行（LF 与 CRLF）的引号值整体遮蔽", () => {
+	for (const nl of ["\n", "\r\n"]) {
+		const s = `password="alpha\\${nl}beta" ok`;
+		assert.equal(redact(s), 'password="[已脱敏]" ok', JSON.stringify(s));
+	}
+});

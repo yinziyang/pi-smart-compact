@@ -290,3 +290,19 @@ test("recall_history 的参数校验错误与找不到条目的回显都经脱�
 	assert.ok(outs[0].length <= 10000, String(outs[0].length));
 	assert.ok(!outs[1].includes(key));
 });
+
+test("recall_history：校验错误不回显 JSON 参数里的秘密，历史工具参数按键名脱敏后才进入召回结果", async () => {
+	const r = await run({
+		steps: ["登录后再召回"],
+		chat: (n) => {
+			if (n === 0) return fauxAssistantMessage(fauxToolCall("bash", { command: "echo hi", password: ["alpha beta", "gamma"] }), { stopReason: "toolUse" });
+			if (n === 1) return fauxAssistantMessage(fauxToolCall("recall_history", { entryId: 'password="alpha beta"' }), { stopReason: "toolUse" });
+			if (n === 2) return fauxAssistantMessage(fauxToolCall("recall_history", { query: "echo" }), { stopReason: "toolUse" });
+			return say("完成");
+		},
+	});
+	const outs = r.entries.filter((e) => e.type === "message" && (e.message as { toolName?: string; role?: string }).role === "toolResult" && (e.message as { toolName?: string }).toolName === "recall_history").map((e) => JSON.stringify((e.message as { content: unknown }).content));
+	assert.equal(outs.length, 2);
+	for (const o of outs) assert.ok(!o.includes("alpha beta") && !o.includes("gamma"), o);
+	assert.match(outs[1], /echo hi/);
+});

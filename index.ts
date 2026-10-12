@@ -21,7 +21,7 @@ import { applyEdits, contentText, findInvalidation, messageText, toolCalls, type
 import { extractPack, type RecoveryRecord } from "./pack.ts";
 import { capRecall, recallById, recallByQuery, validRecoveryRecords, type RecallDoc } from "./recall.ts";
 import * as rec from "./recovery.ts";
-import { redact } from "./redact.ts";
+import { redact, redactDeep } from "./redact.ts";
 import { compactionSettingsFor, MAX_RECORDS, parseConfig, restoreState, STATE_TYPE, freshState, type CompactionRecord, type Config, type PersistedState, type R5Reason } from "./state.ts";
 
 /** 已验证的 pi 版本；不一致时不接管摘要（方案风险 2）。 */
@@ -29,6 +29,8 @@ export const VERIFIED_PI_VERSION = "1.1.0";
 const RESET_TYPE = "smart-compact-reset";
 const INVALIDATED_TYPE = "smart-compact-invalidated";
 const STATUS_KEY = "smart-compact";
+/** recall_history 参数校验失败时的固定返回，不回显参数。 */
+const RECALL_ARG_ERROR = "recall_history 参数无效：query 为必填字符串（空格分隔的关键词），entryId 为可选字符串。";
 /** 旧摘要作废后替换进模型上下文的固定短通知（不超过 1000 字节）。 */
 export const INVALID_NOTICE = "（较早的压缩摘要依据的历史已被修改，该摘要已作废，正在重建。需要压缩前的细节时调用 recall_history 取回。）";
 
@@ -434,7 +436,8 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		// recall_history 的最终结果在落盘前统一脱敏并裁剪：pi 的参数校验错误会在 execute 之前生成并回显完整参数，绕过工具内部的处理（方案第 6 节）。
 		if (m.role === "toolResult" && m.toolName === "recall_history") {
 			const text = contentText(m.content);
-			const safe = capRecall(redact(text));
+			// 本工具的 execute 不返回错误；出错结果来自 pi 的参数校验，它会以 JSON 回显完整参数，文本脱敏无法可靠处理，改为不回显参数的固定说明。
+			const safe = (m as { isError?: boolean }).isError ? RECALL_ARG_ERROR : capRecall(redact(text));
 			if (safe === text) return;
 			return { message: { ...(e.message as object), content: [{ type: "text", text: safe }] } as typeof e.message };
 		}
@@ -685,7 +688,8 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		for (const e of applyEdits(branch)) {
 			const m = e.message;
 			if (e.type !== "message" || !m) continue;
-			const calls = toolCalls(m).map((c) => `[调用 ${c.name}] ${JSON.stringify(c.args)}`);
+			// 参数先按键名深度脱敏再序列化：序列化后的 JSON 文本无法可靠地按文本规则脱敏。
+			const calls = toolCalls(m).map((c) => `[调用 ${c.name}] ${JSON.stringify(redactDeep(c.args))}`);
 			const text = [messageText(m), ...calls].filter(Boolean).join("\n");
 			if (text) docs.push({ entryId: e.id, role: m.role === "toolResult" ? `toolResult(${m.toolName ?? ""})` : m.role, time: e.timestamp ?? "", text: redact(text) });
 		}
