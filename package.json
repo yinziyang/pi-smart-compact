@@ -1,0 +1,27 @@
+{
+  "name": "pi-smart-compact",
+  "version": "0.1.0",
+  "description": "pi 的状态感知压缩扩展：按原生窗口减固定余量触发，接管摘要生成并保留执行状态。",
+  "type": "module",
+  "private": true,
+  "license": "UNLICENSED",
+  "keywords": ["pi-package"],
+  "packageManager": "npm@11.16.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "preview": "node eval/preview.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "1.1.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@types/node": "24.19.2",
+    "typebox": "1.3.36",
+    "typescript": "7.0.2"
+  }
+}
