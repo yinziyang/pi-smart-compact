@@ -1,3 +1,4 @@
 node_modules/
 .isolated/
 preview.json
+spike/.vendor/

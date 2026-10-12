@@ -34,6 +34,8 @@ export default function probe(pi: ExtensionAPI): void {
 	let sessionId = "";
 
 	const log = (ev: string, data: Json = {}, ctx?: ExtensionContext) => {
+		// 进程内 faux spike 用这个共享序列把探针事件与 provider 调用排成一条时间线，精确统计中止后的调用次数。
+		(globalThis as { __probeSeq?: string[] }).__probeSeq?.push(ev);
 		if (!logFile) return;
 		const usage = ctx?.getContextUsage();
 		const row = { t: Date.now(), pid: process.pid, session: sessionId, ev, ctxTokens: usage?.tokens ?? null, ctxWindow: usage?.contextWindow ?? null, ...data };

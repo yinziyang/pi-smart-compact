@@ -353,7 +353,7 @@ const SPIKES: SpikeDef[] = [
 	},
 	{
 		id: "S13",
-		title: "pi-subagents 子会话是否加载 -e 显式指定的扩展",
+		title: "pi-subagents 子会话是否加载 -e 显式指定的扩展（预期不加载，作为事实确认）",
 		isolate: SMALL,
 		steps: [
 			{
@@ -361,10 +361,13 @@ const SPIKES: SpikeDef[] = [
 				worst: amounts(10, 30_000),
 			},
 		],
-		check([s]) {
+		check([s], entries) {
 			const sessions = [...new Set(s.rows.map((r) => r.session).filter(Boolean))];
-			const childStarts = s.rows.filter((r) => r.ev === "session_start").length;
-			return { pass: sessions.length >= 2, notes: [`探针看到的会话 ${sessions.length} 个，session_start ${childStarts} 次。子会话加载了 -e 扩展：${sessions.length >= 2}。`] };
+			const parent = sessions[0];
+			const childRan = s.result.actual !== null && s.result.actual.requests >= 2 && entries.length > 0;
+			// 预期阴性：子会话确实运行了（子会话文件由运行器单独归档），但探针只在父会话记录。
+			const notes = [`探针记录到的会话 id：${sessions.join("、") || "无"}（父会话 ${parent ?? "无"}）。`, `子会话加载了 -e 扩展：${sessions.length >= 2}；本项预期为 false。`];
+			return { pass: childRan && sessions.length === 1, notes };
 		},
 	},
 ];

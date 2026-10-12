@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import budgetGuard, { readGuardLimits, shouldBlock } from "../eval/budget-guard.ts";
+import budgetGuard, { readGuardLimits, resetGuardState, shouldBlock } from "../eval/budget-guard.ts";
 
 test("readGuardLimits：两项都是正整数才有效", () => {
 	assert.deepEqual(readGuardLimits({ PI_BUDGET_MAX_REQUESTS: "3", PI_BUDGET_MAX_BILLED_TOKENS: "1000" }), { maxRequests: 3, maxBilledTokens: 1000 });
@@ -21,7 +21,8 @@ test("shouldBlock：再发一次会超请求数、或 token 已用满时中止�
 
 type Handler = (event: unknown, ctx: { abort(): void }) => void;
 
-function load(env: Record<string, string | undefined>) {
+function load(env: Record<string, string | undefined>, fresh = true) {
+	if (fresh) resetGuardState();
 	const handlers = new Map<string, Handler>();
 	const saved = { ...process.env };
 	// process.env 会把 undefined 转成字符串 "undefined"，所以 undefined 的项要删除而不是赋值。
@@ -62,4 +63,18 @@ test("扩展：环境变量缺失时第一个回合就中止", () => {
 	const g = load({ PI_BUDGET_MAX_REQUESTS: undefined, PI_BUDGET_MAX_BILLED_TOKENS: undefined });
 	g.emit("turn_start", {});
 	assert.equal(g.aborted(), 1);
+});
+
+test("扩展：同一进程内的多个实例（父会话与子会话）共享计数", () => {
+	const env = { PI_BUDGET_MAX_REQUESTS: "2", PI_BUDGET_MAX_BILLED_TOKENS: "1000000", PI_BUDGET_GUARD_LOG: undefined };
+	const parent = load(env);
+	const child = load(env, false);
+	parent.emit("message_end", { message: { role: "assistant", usage: { input: 1 } } });
+	child.emit("turn_start", {});
+	assert.equal(child.aborted(), 0);
+	child.emit("message_end", { message: { role: "assistant", usage: { input: 0, output: 0 } } });
+	child.emit("turn_start", {});
+	parent.emit("turn_start", {});
+	assert.equal(child.aborted(), 1);
+	assert.equal(parent.aborted(), 1);
 });
