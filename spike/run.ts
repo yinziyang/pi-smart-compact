@@ -63,7 +63,7 @@ interface SpikeDef {
 	check(steps: StepOutcome[], entries: Entry[]): { pass: boolean; notes: string[] };
 }
 
-function amounts(requests: number, avgIn: number, avgOut = 2_000): Amounts {
+export function amounts(requests: number, avgIn: number, avgOut = 2_000): Amounts {
 	return {
 		requests,
 		inputTokens: requests * avgIn,
@@ -74,7 +74,7 @@ function amounts(requests: number, avgIn: number, avgOut = 2_000): Amounts {
 	};
 }
 
-function readJsonl(file: string): Record<string, unknown>[] {
+export function readJsonl(file: string): Record<string, unknown>[] {
 	if (!existsSync(file)) return [];
 	return readFileSync(file, "utf8")
 		.split("\n")
@@ -104,7 +104,7 @@ function orderOf(rows: ProbeRow[], evs: string[]): number[] {
 	return evs.map((e) => rows.findIndex((r) => r.ev === e));
 }
 
-async function rpcPrompt(io: RpcIo, id: string, message: string, timeoutMs = 600_000): Promise<Record<string, unknown>> {
+export async function rpcPrompt(io: RpcIo, id: string, message: string, timeoutMs = 600_000): Promise<Record<string, unknown>> {
 	const start = io.records.length;
 	io.send({ id, type: "prompt", message });
 	const resp = await io.waitFor((r) => r.type === "response" && r.id === id, 60_000);
@@ -113,7 +113,7 @@ async function rpcPrompt(io: RpcIo, id: string, message: string, timeoutMs = 600
 	return resp;
 }
 
-async function rpcCommand(io: RpcIo, id: string, record: Record<string, unknown>, timeoutMs = 300_000): Promise<Record<string, unknown>> {
+export async function rpcCommand(io: RpcIo, id: string, record: Record<string, unknown>, timeoutMs = 300_000): Promise<Record<string, unknown>> {
 	io.send({ id, ...record });
 	return io.waitFor((r) => r.type === "response" && r.id === id, timeoutMs);
 }
@@ -372,7 +372,7 @@ const SPIKES: SpikeDef[] = [
 	},
 ];
 
-function collectEntries(dirs: string[]): Entry[] {
+export function collectEntries(dirs: string[]): Entry[] {
 	const out: Entry[] = [];
 	const walk = (d: string) => {
 		if (!existsSync(d)) return;

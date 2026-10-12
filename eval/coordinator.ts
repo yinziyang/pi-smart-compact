@@ -61,6 +61,11 @@ export interface StepSpec {
 	 */
 	unobservableCalls?: boolean;
 	/**
+	 * 为真表示守卫已经作为隔离配置 packages 的第一项安装（涉及 pi-subagents 子会话的步骤，方案 F49），不再追加 -e 守卫。
+	 * 守卫的计数挂在进程级共享状态上，同一进程加载两份会让同一个会话的预占冲突，所以两种方式只能选一种。
+	 */
+	guardViaPackages?: boolean;
+	/**
 	 * 可选的交互驱动，用于 RPC 模式：通过 io 向子进程 stdin 发 JSONL 命令、等待 stdout 上的记录。
 	 * drive 结束后协调脚本关闭 stdin，请求子进程有序退出。不提供时 stdin 直接关闭。
 	 */
@@ -152,7 +157,7 @@ export async function withCoordinator<T>(
 
 		const started = Date.now();
 		// 守卫放在第一个 -e：它的 session_before_compact 必须先于其他扩展（产生摘要调用的 handler）执行。
-		const child = spawn(spec.piBin ?? "pi", ["-e", GUARD_PATH, ...spec.args], {
+		const child = spawn(spec.piBin ?? "pi", spec.guardViaPackages ? spec.args : ["-e", GUARD_PATH, ...spec.args], {
 			cwd: spec.cwd,
 			env: {
 				...spec.env,

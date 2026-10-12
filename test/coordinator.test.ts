@@ -142,3 +142,10 @@ test("含不可观测调用的步骤按无法核实结算，保留全额预留",
 	assert.equal(r.actual, null);
 	assert.equal(spent(readLedger(paths.ledgerFile)).requests, worst.requests);
 });
+
+test("守卫经 packages 安装时不再追加 -e 守卫", async () => {
+	const { paths, sessions } = fresh();
+	await withCoordinator("run", (run) => run({ ...spec(sessions, {}), guardViaPackages: true }), paths);
+	const seen = JSON.parse(readFileSync(join(sessions, "s.jsonl.env.json"), "utf8"));
+	assert.deepEqual(seen.args, ["--print", "hi"]);
+});
