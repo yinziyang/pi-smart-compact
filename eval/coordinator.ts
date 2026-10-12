@@ -55,6 +55,20 @@ export interface StepSpec {
 	sessionDirs: string[];
 	/** pi 可执行文件，默认 "pi"（按 env.PATH 查找）。 */
 	piBin?: string;
+	/**
+	 * 可选的交互驱动，用于 RPC 模式：通过 io 向子进程 stdin 发 JSONL 命令、等待 stdout 上的记录。
+	 * drive 结束后协调脚本关闭 stdin，请求子进程有序退出。不提供时 stdin 直接关闭。
+	 */
+	drive?: (io: RpcIo) => Promise<void>;
+}
+
+/** RPC 交互接口。stdout 按 LF 切分为记录，不使用 readline（它会把 U+2028 当作换行）。 */
+export interface RpcIo {
+	send(record: Record<string, unknown>): void;
+	/** 等待第一条满足 pred 的记录（含之前已收到但未被消费的记录），超时抛错。 */
+	waitFor(pred: (r: Record<string, unknown>) => boolean, timeoutMs: number): Promise<Record<string, unknown>>;
+	/** 迄今收到的全部记录。 */
+	records: Record<string, unknown>[];
 }
 
 export interface StepResult {
@@ -65,6 +79,10 @@ export interface StepResult {
 	actual: Amounts | null;
 	stdout: string;
 	stderr: string;
+	/** stdout 中解析出的 JSONL 记录（RPC 或 --mode json 时有内容）。 */
+	records: Record<string, unknown>[];
+	/** drive 回调抛出的错误，没有时为 undefined。 */
+	driveError?: string;
 }
 
 function collectSessionFiles(dirs: string[], sinceMs: number): string[] {
@@ -135,13 +153,59 @@ export async function withCoordinator<T>(
 				PI_BUDGET_MAX_REQUESTS: String(spec.worst.requests),
 				PI_BUDGET_MAX_BILLED_TOKENS: String(spec.worst.billedTokens),
 			},
-			stdio: ["ignore", "pipe", "pipe"],
+			stdio: ["pipe", "pipe", "pipe"],
 		});
 		current = child;
 		let stdout = "";
 		let stderr = "";
-		child.stdout?.on("data", (d) => (stdout += String(d)));
+		let pending = "";
+		const records: Record<string, unknown>[] = [];
+		const waiters: Array<{ pred: (r: Record<string, unknown>) => boolean; resolve: (r: Record<string, unknown>) => void; from: number }> = [];
+		const offer = () => {
+			for (let i = waiters.length - 1; i >= 0; i--) {
+				const w = waiters[i];
+				const hit = records.slice(w.from).find(w.pred);
+				if (hit) {
+					waiters.splice(i, 1);
+					w.resolve(hit);
+				}
+			}
+		};
+		child.stdout?.on("data", (d) => {
+			const text = String(d);
+			stdout += text;
+			pending += text;
+			let nl = pending.indexOf("\n");
+			while (nl >= 0) {
+				const line = pending.slice(0, nl).replace(/\r$/, "");
+				pending = pending.slice(nl + 1);
+				if (line.trim()) {
+					try {
+						records.push(JSON.parse(line) as Record<string, unknown>);
+					} catch {
+						// 非 JSON 的 stdout 行（例如 -p 模式的回答文本）只保留在 stdout 里。
+					}
+				}
+				nl = pending.indexOf("\n");
+			}
+			offer();
+		});
 		child.stderr?.on("data", (d) => (stderr += String(d)));
+		const io: RpcIo = {
+			records,
+			send: (record) => child.stdin?.write(`${JSON.stringify(record)}\n`),
+			waitFor: (pred, timeoutMs) =>
+				new Promise((resolveWait, rejectWait) => {
+					const hit = records.find(pred);
+					if (hit) return resolveWait(hit);
+					const timer = setTimeout(() => rejectWait(new Error(`等待 RPC 记录超时（${timeoutMs}ms）`)), timeoutMs);
+					waiters.push({ pred, from: 0, resolve: (r) => (clearTimeout(timer), resolveWait(r)) });
+				}),
+		};
+		let driveError: unknown;
+		const driving = (spec.drive ? spec.drive(io) : Promise.resolve()).catch((err: unknown) => {
+			driveError = err;
+		}).finally(() => child.stdin?.end());
 
 		let timedOut = false;
 		const timer = setTimeout(() => {
@@ -156,11 +220,12 @@ export async function withCoordinator<T>(
 		});
 		clearTimeout(timer);
 		current = undefined;
+		await driving;
 
 		const actual = sumUsage(collectSessionFiles(spec.sessionDirs, started), Date.now() - started);
 		const settle = makeSettle(readLedger(paths.ledgerFile), id, actual, new Date().toISOString());
 		if (settle) appendRecord(paths.ledgerFile, settle);
-		return { step: spec.step, reservationId: id, exitCode, timedOut, actual, stdout, stderr };
+		return { step: spec.step, reservationId: id, exitCode, timedOut, actual, stdout, stderr, records, driveError: driveError === undefined ? undefined : String(driveError) };
 	};
 
 	try {

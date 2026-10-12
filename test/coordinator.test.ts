@@ -94,3 +94,42 @@ test("非法上限不写入账本", () => {
 	assert.throws(() => initLimits({ requests: -1 } as never, paths));
 	assert.deepEqual(readLedger(paths.ledgerFile), []);
 });
+
+const FAKE_RPC = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "fake-rpc.mjs");
+
+test("drive：通过 stdin 发命令、按 LF 切分 stdout 记录、结束后关闭 stdin 让子进程退出", async () => {
+	const { paths, sessions } = fresh();
+	const r = await withCoordinator(
+		"run",
+		(run) =>
+			run({
+				...spec(sessions, {}),
+				args: [FAKE_RPC],
+				drive: async (io) => {
+					for (const n of [1, 2]) {
+						const start = io.records.length;
+						io.send({ id: `p${n}`, type: "prompt", message: "hi" });
+						const settled = await io.waitFor((x) => x.type === "agent_settled" && io.records.indexOf(x) >= start, 5_000);
+						assert.equal(settled.n, n);
+						assert.equal(settled.text, "含 分隔符");
+					}
+				},
+			}),
+		paths,
+	);
+	assert.equal(r.exitCode, 0);
+	assert.equal(r.driveError, undefined);
+	assert.equal(r.actual?.requests, 2);
+	assert.equal(r.records.filter((x) => x.type === "response").length, 2);
+});
+
+test("drive 超时：记录 driveError，子进程仍被关闭 stdin 后退出", async () => {
+	const { paths, sessions } = fresh();
+	const r = await withCoordinator(
+		"run",
+		(run) => run({ ...spec(sessions, {}), args: [FAKE_RPC], drive: async (io) => void (await io.waitFor((x) => x.type === "never", 200)) }),
+		paths,
+	);
+	assert.match(r.driveError ?? "", /超时/);
+	assert.equal(r.exitCode, 0);
+});
