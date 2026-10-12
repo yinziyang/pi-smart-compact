@@ -19,7 +19,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Amounts, LEDGER_VERSION, type LedgerRecord, type Limits, limitsOf, makeReserve, makeSettle, parseRecord, spent } from "./ledger.ts";
 import { acquireLock, appendRecord, readLedger, releaseLock } from "./ledger-file.ts";
-import { usageFromSessionFile } from "./session-usage.ts";
+import { usageFromSessionText } from "./session-usage.ts";
 
 /** 账本与锁文件所在目录。 */
 export const COLLAB_DIR = join(homedir(), ".pi", "agent", ".collab", "smart-compact");
@@ -104,26 +104,39 @@ export interface StepResult {
 	driveError?: string;
 }
 
-function collectSessionFiles(dirs: string[], sinceMs: number): string[] {
-	const out: string[] = [];
+/** 会话目录下全部 .jsonl 文件的字节数快照，键为路径。 */
+export function snapshotSessionFiles(dirs: string[]): Map<string, number> {
+	const out = new Map<string, number>();
 	const walk = (dir: string) => {
 		if (!existsSync(dir)) return;
 		for (const name of readdirSync(dir)) {
 			const p = join(dir, name);
 			const st = statSync(p);
 			if (st.isDirectory()) walk(p);
-			else if (name.endsWith(".jsonl") && st.mtimeMs >= sinceMs) out.push(p);
+			else if (name.endsWith(".jsonl")) out.set(p, st.size);
 		}
 	};
 	for (const d of dirs) walk(d);
 	return out;
 }
 
-/** 汇总多个会话文件的用量；任何一个不可读或损坏时返回 null。 */
-function sumUsage(files: string[], wallMs: number): Amounts | null {
+/**
+ * 汇总步骤期间追加到会话文件里的用量；任何一段不可读或损坏时返回 null。
+ * 会话文件只追加，所以只统计步骤开始时文件长度之后的部分：回放评测把真实会话复制进来续写，副本里原有的历史 usage 不是本步骤的开销。
+ */
+export function sumUsage(before: Map<string, number>, after: Map<string, number>, wallMs: number): Amounts | null {
 	const total: Amounts = { requests: 0, inputTokens: 0, outputTokens: 0, billedTokens: 0, costUsd: 0, wallMs };
-	for (const f of files) {
-		const u = usageFromSessionFile(f);
+	for (const [f, size] of after) {
+		const start = before.get(f) ?? 0;
+		if (size === start) continue;
+		if (size < start) return null;
+		let text: string;
+		try {
+			text = readFileSync(f).subarray(start).toString("utf8");
+		} catch {
+			return null;
+		}
+		const u = usageFromSessionText(text);
 		if (!u) return null;
 		total.requests += u.requests;
 		total.inputTokens += u.inputTokens;
@@ -165,6 +178,7 @@ export async function withCoordinator<T>(
 		appendRecord(paths.ledgerFile, makeReserve(readLedger(paths.ledgerFile), id, spec.step, spec.worst, new Date().toISOString()));
 
 		const started = Date.now();
+		const sizesBefore = snapshotSessionFiles(spec.sessionDirs);
 		// 守卫放在第一个 -e：它的 session_before_compact 必须先于其他扩展（产生摘要调用的 handler）执行。
 		const child = spawn(spec.piBin ?? "pi", spec.guardViaPackages ? spec.args : ["-e", GUARD_PATH, ...spec.args], {
 			cwd: spec.cwd,
@@ -245,7 +259,7 @@ export async function withCoordinator<T>(
 		current = undefined;
 		await driving;
 
-		const actual = spec.unobservableCalls ? null : sumUsage(collectSessionFiles(spec.sessionDirs, started), Date.now() - started);
+		const actual = spec.unobservableCalls ? null : sumUsage(sizesBefore, snapshotSessionFiles(spec.sessionDirs), Date.now() - started);
 		const settle = makeSettle(readLedger(paths.ledgerFile), id, actual, new Date().toISOString());
 		if (settle) appendRecord(paths.ledgerFile, settle);
 		return { step: spec.step, reservationId: id, exitCode, timedOut, actual, stdout, stderr, records, driveError: driveError === undefined ? undefined : String(driveError) };

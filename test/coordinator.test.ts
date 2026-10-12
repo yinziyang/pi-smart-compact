@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
@@ -148,4 +148,13 @@ test("守卫经 packages 安装时不再追加 -e 守卫", async () => {
 	await withCoordinator("run", (run) => run({ ...spec(sessions, {}), guardViaPackages: true }), paths);
 	const seen = JSON.parse(readFileSync(join(sessions, "s.jsonl.env.json"), "utf8"));
 	assert.deepEqual(seen.args, ["--print", "hi"]);
+});
+
+test("只结算步骤期间追加的用量：会话副本里原有的历史 usage 不计入", async () => {
+	const { paths, sessions } = fresh();
+	const history = Array.from({ length: 5 }, () => JSON.stringify({ type: "message", message: { role: "assistant", usage: { input: 1000, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 1 } } } }));
+	writeFileSync(join(sessions, "s.jsonl"), `${JSON.stringify({ type: "session", id: "copy" })}\n${history.join("\n")}\n`);
+	const r = await withCoordinator("run", (run) => run(spec(sessions, { FAKE_REQUESTS: "2", FAKE_APPEND: "1" })), paths);
+	assert.equal(r.actual?.requests, 2);
+	assert.equal(r.actual?.costUsd, 0.02);
 });

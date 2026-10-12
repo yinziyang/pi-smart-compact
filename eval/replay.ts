@@ -44,7 +44,10 @@ const QUESTIONS = [
 const GROUPS = ["O", "A", "B", "C"] as const;
 type Group = (typeof GROUPS)[number];
 
-/** 单次请求的预留：守卫按「窗口 + maxTokens」预占计费 token；费用按 luna 价目（输入 0.1、输出 0.5 美元每百万 token）。 */
+/**
+ * 单次请求的预留：守卫按「窗口 + maxTokens」预占计费 token；费用按 luna 价目（输入 0.1、输出 0.5 美元每百万 token）。
+ * 压缩步骤的请求数至少要 13：守卫在 session_before_compact 中按 12 次单次最坏值预占，不够时直接取消压缩。
+ */
 function worst(requests: number, avgIn: number, avgOut = 8_000): Amounts {
 	return {
 		requests,
@@ -162,9 +165,11 @@ async function main(argv: string[]): Promise<number> {
 				const files: Record<Group, string> = { O: baseFile, A: join(baseDir, "A.jsonl"), B: join(baseDir, "B.jsonl"), C: join(baseDir, "C.jsonl") };
 				for (const g of ["A", "B", "C"] as const) {
 					copyFileSync(baseFile, files[g]);
+					const countComps = () => readFileSync(files[g], "utf8").split("\n").filter((l) => l.includes('"type":"compaction"')).length;
+					const before = countComps();
 					const ext = g === "A" ? ["-ne"] : ["-ne", "-e", join(ROOT, "index.ts")];
 					const env: Record<string, string> = g === "C" ? { PI_SMART_COMPACT_FAULT: "main" } : {};
-					const r = await step(`compact-${g}`, [...ext, ...BASE, "-nt", "--mode", "rpc", "--session", files[g]], worst(g === "A" ? 4 : 12, t.tokens, 16_000), env, baseDir, async (io) => {
+					const r = await step(`compact-${g}`, [...ext, ...BASE, "-nt", "--mode", "rpc", "--session", files[g]], worst(13, t.tokens, 16_000), env, baseDir, async (io) => {
 						const resp = await rpcCommand(io, "c", { type: "compact" }, 20 * 60_000);
 						if (resp.success !== true) throw new Error(`compact 失败：${JSON.stringify(resp).slice(0, 300)}`);
 					});
@@ -173,7 +178,8 @@ async function main(argv: string[]): Promise<number> {
 					const last = comps.at(-1) as { details?: { smartCompact?: number; fallback?: boolean; stats?: unknown; budget?: unknown }; summary?: string; tokensBefore?: number } | undefined;
 					res.compactions[g] = { count: comps.length, own: last?.details?.smartCompact === 1, fallback: last?.details?.fallback, summaryChars: last?.summary?.length, stats: last?.details?.stats, budget: last?.details?.budget, exit: r.exitCode };
 					if (g === "C") res.cFallback = last?.details?.fallback === true;
-					if (comps.length !== 1) res.errors.push(`${g} 组压缩阶段新增 ${comps.length} 条 compaction，样本作废`);
+					// 原会话里可能已有 compaction，只看本阶段新增的条数。
+					if (countComps() - before !== 1) res.errors.push(`${g} 组压缩阶段新增 ${countComps() - before} 条 compaction，样本作废`);
 				}
 
 				// 答题：每个组别与问题各一份副本。

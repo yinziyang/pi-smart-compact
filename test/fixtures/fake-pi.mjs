@@ -4,8 +4,9 @@
 //   FAKE_REQUESTS：写入几条带 usage 的 assistant 消息，默认 1。
 //   FAKE_SLEEP_MS：退出前休眠的毫秒数，用于测试超时终止。
 //   FAKE_CORRUPT=1：写一行坏 JSON，用于测试用量缺失。
+//   FAKE_APPEND=1：追加到已有会话文件末尾，而不是覆盖，用于测试只结算新追加的部分。
 // 同时把收到的预算环境变量与参数写到 FAKE_SESSION_FILE + ".env.json"，供测试核对。
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 
 const file = process.env.FAKE_SESSION_FILE;
 const n = Number(process.env.FAKE_REQUESTS ?? "1");
@@ -15,7 +16,8 @@ if (file) {
 		lines.push(JSON.stringify({ type: "message", message: { role: "assistant", usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } }));
 	}
 	if (process.env.FAKE_CORRUPT === "1") lines.push("{坏");
-	writeFileSync(file, `${lines.join("\n")}\n`);
+	if (process.env.FAKE_APPEND === "1") appendFileSync(file, `${lines.slice(1).join("\n")}\n`);
+	else writeFileSync(file, `${lines.join("\n")}\n`);
 	writeFileSync(`${file}.env.json`, JSON.stringify({
 		maxRequests: process.env.PI_BUDGET_MAX_REQUESTS,
 		maxTokens: process.env.PI_BUDGET_MAX_BILLED_TOKENS,

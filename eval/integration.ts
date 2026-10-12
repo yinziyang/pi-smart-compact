@@ -58,10 +58,12 @@ function fillerText(n: number): string {
 		const w = Array.from({ length: 10 }, (_, k) => words[(n * 31 + i * 7 + k * 3) % words.length]).join(" ");
 		lines.push(`file ${n} line ${i}: ${w} ${(n * 1000003 + i * 7919) % 100000}`);
 	}
-	return `${lines.join("\n")}\nEND part-${String(n).padStart(2, "0")} code=${endCode(n)}\n`;
+	// END 标记放在文件中间一个由序号决定的位置：只能读全文才能找到它，用 offset 直接读末尾无效。
+	lines.splice(100 + ((n * 37) % 400), 0, `END part-${String(n).padStart(2, "0")} code=${endCode(n)}`);
+	return `${lines.join("\n")}\n`;
 }
 
-/** 每个合成文件最后一行里的校验码。 */
+/** 每个合成文件里 END 标记行的校验码。 */
 export function endCode(n: number): string {
 	return String(((n * 48271) % 899_999) + 100_000);
 }
@@ -142,6 +144,8 @@ interface CaseDef {
 	id: string;
 	title: string;
 	window?: number;
+	/** 额外的 pi 参数，例如 --tools。 */
+	extraArgs?: string[];
 	/** packages 加载的扩展（守卫自动放在第一项）；为空时用 -ne 加 -e 加载本扩展。 */
 	packages?: (root: string) => string[];
 	worst: Amounts;
@@ -239,14 +243,16 @@ const CASES: CaseDef[] = [
 		title: "pi-goal：多轮任务累计压缩两次以上，目标仍有效，评估者输入含压缩包的验证记录且不超过整体上限，最终达成",
 		window: 160_000,
 		packages: (root) => [ROOT, copyPiGoal(root)],
+		extraArgs: ["--tools", "read,write,recall_history"],
 		worst: worstFor(90, 160_000),
 		unobservableCalls: true,
 		async rpc(io, c) {
 			const list = c.docs.slice(0, 30);
 			c.extra.list = list.map((f) => f.split("/").at(-1));
-			// 完成条件只依赖最后一条回复里能看到的证据：读文件的过程会随压缩移出上下文，评估者无法据此核实。
-			await rpcPrompt(io, "w", `接下来的任务：先在 ${c.project} 运行 npm test。然后用 read 工具逐个读取下面 ${list.length} 个文件的全文（每次只读一个，不要用 bash 的 tail、head 或 cat 读取这些文件），记下每个文件最后一行（形如 END part-NN code=XXXXXX）。最后把这 ${list.length} 行按文件顺序写入 ${join(c.project, "notes", "result.txt")}。文件：${list.join("、")}。先只回复「收到」。`);
-			await rpcPrompt(io, "g", `/goal ${join(c.project, "notes", "result.txt")} 已写好，按顺序包含 ${list.length} 行、每行是对应文件的最后一行（形如 END part-NN code=XXXXXX）；最后一条回复贴出 cat 该文件的完整输出，以及 npm test 输出的 all tests passed。`);
+			// 验证记录来自用户经 RPC 执行的 npm test（bashExecution）；agent 只有 read、write 与 recall_history，无法用 grep 或 tail 绕过全文读取。
+			await rpcCommand(io, "b", { type: "bash", command: "npm test" }, 120_000);
+			await rpcPrompt(io, "w", `接下来的任务：用 read 工具逐个读取下面 ${list.length} 个文件的全文（每次只读一个），在每个文件里找到以 END 开头的那一行（形如 END part-NN code=XXXXXX，位置在文件中间，不在末尾）。最后把这 ${list.length} 行按文件顺序写入 ${join(c.project, "notes", "result.txt")}。文件：${list.join("、")}。先只回复「收到」。`);
+			await rpcPrompt(io, "g", `/goal ${join(c.project, "notes", "result.txt")} 已写好，按顺序包含 ${list.length} 行，每行是对应文件中以 END 开头的那一行；最后一条回复贴出该文件写入时的完整内容。`);
 			c.extra.ended = await waitSession(io, c.sessionDir, (e) => e.some((x) => x.customType === "pi-goal" && (x.data as { type?: string }).type === "end"), 40 * 60_000);
 		},
 		check(c, entries, result) {
@@ -359,7 +365,7 @@ async function main(ids: string[]): Promise<number> {
 				const result = await runStep({
 					step: def.id,
 					worst: def.worst,
-					args: [...loadArgs, ...mode, "--session-dir", sessionDir, ...(def.args?.(c) ?? [])],
+					args: [...loadArgs, ...(def.extraArgs ?? []), ...mode, "--session-dir", sessionDir, ...(def.args?.(c) ?? [])],
 					env: { ...iso.env, PROBE_LOG: join(root, "probe.jsonl"), PROBE_MODE: "" },
 					cwd: iso.projectDir,
 					sessionDirs: [sessionDir, join(iso.agentDir, "subagent-sessions")],
