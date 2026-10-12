@@ -179,18 +179,21 @@ const SCENARIOS: Scenario[] = [
 		models: SMALL_MODEL,
 		probeMode: "abort-in-compact",
 		steps: [
-			{ prompt: "反复读取 notes.md，读满七次。", autoCompaction: false },
+			{ prompt: "反复读取 notes.md，读满四次。", autoCompaction: false },
 			{ prompt: "只回复好。", autoCompaction: true },
 		],
-		route: ({ n, lastRole }) => (n < 7 ? read() : lastRole === "toolResult" ? done() : done()),
+		// faux 的 usage 把 cacheWrite 也计入输入，每读一次约增加 2864 token；读 4 次后约 19517，落在触发点 18000 与窗口 20000 之间，所以这里是阈值压缩而不是溢出。
+		route: ({ n }) => (n < 4 ? read() : done()),
 		check(ctx) {
 			const r = abortCheck("新提示词前")(ctx);
+			const reason = ctx.rows.find((x) => x.ev === "session_before_compact")?.reason;
+			r.notes.push(`压缩原因：${reason}（应为 threshold）。`);
 			const i = ctx.seq.indexOf("probe_abort");
 			const order = ctx.seq.slice(Math.max(0, i - 3), i + 6).join(" → ");
 			r.notes.push(`中止前后的时间线：${order}。`);
 			const atTurn = ctx.rows.some((x) => x.ev === "probe_abort" && x.at === "turn_start");
 			r.notes.push(`由 turn_start 补中止：${atTurn}。`);
-			return { pass: r.pass && atTurn, notes: r.notes };
+			return { pass: r.pass && atTurn && reason === "threshold", notes: r.notes };
 		},
 	},
 	{
@@ -249,12 +252,55 @@ const SCENARIOS: Scenario[] = [
 			const notes = [
 				`faux provider 全程调用 ${calls} 次，上限 3。`,
 				`子会话文件中的 assistant 记录 ${childRequests} 条（子会话确实运行并发出了请求）。`,
-				`守卫中止记录 ${guard.length} 条：${guard.map((g) => `已用 ${(g.state as { requests: number }).requests} 次`).join("、") || "无"}。`,
+				`守卫拦截记录 ${guard.length} 条：${guard.map((g) => `已结算 ${g.requests} 次、在途 ${g.pendingRequests} 次`).join("、") || "无"}。`,
 			];
 			return { pass: calls <= 3 && childRequests >= 1 && guard.length >= 1, notes };
 		},
 	},
+	{
+		id: "S13-guard-concurrent",
+		title: "两个子会话并发、请求数只剩一份时，只有一个能发出请求（调用前预占）",
+		settings: { retry: { enabled: false }, compaction: { enabled: false } },
+		models: SMALL_MODEL,
+		probeMode: "",
+		env: { PI_BUDGET_MAX_REQUESTS: "2", PI_BUDGET_MAX_BILLED_TOKENS: "100000000", PI_FORK_SUBAGENT: "0", PI_BUDGET_GUARD_LOG: "{dir}/guard.jsonl" },
+		extensionFiles: { "budget-guard.ts": GUARD_SOURCE },
+		factories: async () => [(await import(vendorSubagents())).default as ExtensionFactory],
+		steps: [{ prompt: "同时派两个 subagent 去读文件。" }],
+		route: ({ n }) => (n === 0 ? twoAgents() : read()),
+		check({ calls, guard, childRequests }) {
+			return {
+				pass: calls <= 2 && guard.length >= 1,
+				notes: [`faux provider 全程调用 ${calls} 次，请求上限 2；子会话 assistant 记录 ${childRequests} 条；守卫拦截 ${guard.length} 次。`],
+			};
+		},
+	},
+	{
+		id: "S13-guard-tokens",
+		title: "两个子会话并发时，在途的单次最坏 token（窗口 20000 + maxTokens 8000）合计超过余额，后到者被拦下",
+		settings: { retry: { enabled: false }, compaction: { enabled: false } },
+		models: SMALL_MODEL,
+		probeMode: "",
+		env: { PI_BUDGET_MAX_REQUESTS: "100", PI_BUDGET_MAX_BILLED_TOKENS: "50000", PI_FORK_SUBAGENT: "0", PI_BUDGET_GUARD_LOG: "{dir}/guard.jsonl" },
+		extensionFiles: { "budget-guard.ts": GUARD_SOURCE },
+		factories: async () => [(await import(vendorSubagents())).default as ExtensionFactory],
+		steps: [{ prompt: "同时派两个 subagent 去读文件。" }],
+		route: ({ n }) => (n === 0 ? twoAgents() : read()),
+		check({ calls, guard }) {
+			const worst = guard.map((g) => g.worst).filter((w) => w !== undefined);
+			return {
+				pass: calls <= 2 && guard.length >= 1,
+				notes: [`faux provider 全程调用 ${calls} 次；守卫拦截 ${guard.length} 次，拦截时的单次最坏 token ${worst.join("、") || "无"}；token 上限 50000。`],
+			};
+		},
+	},
 ];
+
+/** 一条 assistant 消息里同时发起两个前台 subagent 调用，pi 会并行执行它们。 */
+function twoAgents(): AssistantMessage {
+	const call = (k: string) => fauxToolCall("agent", { description: `读文件${k}`, prompt: "反复读取 notes.md", subagent_type: "general-purpose", run_in_background: false }, { id: `call-${k}` });
+	return fauxAssistantMessage([call("a"), call("b")], { stopReason: "toolUse" });
+}
 
 async function runScenario(sc: Scenario): Promise<boolean> {
 	const dir = mkdtempSync(join(tmpdir(), `sc-faux-${sc.id}-`));
@@ -343,6 +389,8 @@ async function runScenario(sc: Scenario): Promise<boolean> {
 		mkdirSync(out, { recursive: true, mode: 0o700 });
 		if (existsSync(probeLog)) cpSync(probeLog, join(out, "probe.jsonl"));
 		if (existsSync(sessionsDir)) cpSync(sessionsDir, join(out, "sessions"), { recursive: true });
+		if (existsSync(join(agentDir, "subagent-sessions"))) cpSync(join(agentDir, "subagent-sessions"), join(out, "subagent-sessions"), { recursive: true });
+		if (existsSync(join(dir, "guard.jsonl"))) cpSync(join(dir, "guard.jsonl"), join(out, "guard.jsonl"));
 		writeFileSync(join(out, "timeline.json"), `${JSON.stringify(seq)}\n`);
 		writeFileSync(join(out, "result.json"), `${JSON.stringify({ id: sc.id, title: sc.title, providerCalls: faux.state.callCount, ...verdict }, null, 2)}\n`);
 		process.stdout.write(`\n[${sc.id}] ${sc.title}\n  faux 请求 ${faux.state.callCount} 次（不产生费用）\n`);
