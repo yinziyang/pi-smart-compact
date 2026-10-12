@@ -31,10 +31,10 @@ const PRICE = { input: 0.1, output: 0.5 };
 
 /**
  * 一个步骤的预留额度。守卫对每次请求按「窗口 + maxTokens」预占计费 token（方案第 13 节第 0 步），所以 billedTokens 必须按这个口径给足，否则第一个回合就会被中止。
- * 输入、输出与费用按窗口与每次 2 万输出 token 估算，用于账本的分项上限；超支由守卫与结算兜底。
+ * 输入、输出与费用按窗口与每次 8000 输出 token 估算（实测单次输出只有几百 token），用于账本的分项上限；超支由守卫与结算兜底。
  */
 function worstFor(requests: number, window: number): Amounts {
-	const out = 20_000;
+	const out = 8_000;
 	return {
 		requests,
 		inputTokens: requests * window,
@@ -106,11 +106,19 @@ async function readUntilCompaction(io: RpcIo, files: string[], sessionDir: strin
 	return n;
 }
 
-/** 轮询会话文件直到 pred 成立或超时。 */
+/** 本扩展已进入 R5（停止自动压缩）时，运行不会再推进，等待应提前结束。 */
+const stopped = (entries: Entry[]) => {
+	const st = entries.filter((e) => e.type === "custom" && e.customType === "smart-compact").at(-1);
+	return !!(st?.data as { r5?: unknown } | undefined)?.r5;
+};
+
+/** 轮询会话文件直到 pred 成立、本扩展进入 R5 或超时。 */
 async function waitSession(sessionDir: string, pred: (entries: Entry[]) => boolean, timeoutMs: number): Promise<boolean> {
 	const end = Date.now() + timeoutMs;
 	while (Date.now() < end) {
-		if (pred(collectEntries([sessionDir]) as Entry[])) return true;
+		const entries = collectEntries([sessionDir]) as Entry[];
+		if (pred(entries)) return true;
+		if (stopped(entries)) return false;
 		await new Promise((r) => setTimeout(r, 3000));
 	}
 	return false;
@@ -224,12 +232,12 @@ const CASES: CaseDef[] = [
 	{
 		id: "T-goal",
 		title: "pi-goal：多轮任务累计压缩两次以上，目标仍有效，评估者输入含压缩包的验证记录且不超过整体上限，最终达成",
-		window: 80_000,
+		window: 160_000,
 		packages: (root) => [ROOT, copyPiGoal(root)],
-		worst: worstFor(60, 80_000),
+		worst: worstFor(75, 160_000),
 		unobservableCalls: true,
 		async rpc(io, c) {
-			const list = c.docs.slice(0, 10);
+			const list = c.docs.slice(0, 24);
 			c.extra.list = list.map((f) => f.split("/").at(-1));
 			await rpcPrompt(io, "g", `/goal 已在 ${c.project} 运行过 npm test 且看到 all tests passed；并且已经用 read 工具逐个读过下面全部 ${list.length} 个文件（每次只读一个）：${list.join("、")}；最后一条回复按顺序列出这 ${list.length} 个文件名。`);
 			c.extra.ended = await waitSession(c.sessionDir, (e) => e.some((x) => x.customType === "pi-goal" && (x.data as { type?: string }).type === "end"), 40 * 60_000);
@@ -249,9 +257,9 @@ const CASES: CaseDef[] = [
 	{
 		id: "T-goal-constraint",
 		title: "约束只存在于摘要中时，与约束冲突的目标不被评估者判定为达成",
-		window: 80_000,
+		window: 160_000,
 		packages: (root) => [ROOT, copyPiGoal(root)],
-		worst: worstFor(45, 80_000),
+		worst: worstFor(45, 160_000),
 		unobservableCalls: true,
 		async rpc(io, c) {
 			await rpcPrompt(io, "k", `本次会话的硬性约束：不得修改 ${join(c.project, "test")} 目录下的任何文件。只回复「收到」。`);
@@ -314,6 +322,8 @@ async function main(ids: string[]): Promise<number> {
 		for (const def of defs) {
 			assertAuthFresh(SOURCE_AGENT_DIR, MODEL.provider, def.worst.wallMs + 30 * 60_000);
 			const root = join(process.env.TMPDIR ?? "/tmp", `sc-it-${def.id}-${Date.now()}`);
+			// 根目录先按 0700 创建：packages 里的扩展副本要复制进来，不能让复制操作以默认权限先建出根目录。
+			mkdirSync(root, { recursive: true, mode: 0o700 });
 			const packages = def.packages ? [GUARD_PATH, ...def.packages(root)] : [];
 			const iso = createIsolatedEnv({
 				sourceAgentDir: SOURCE_AGENT_DIR,
