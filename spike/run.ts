@@ -85,11 +85,17 @@ const read = (n: number, tail = "全部读完之后只回复「完成」两个�
 		.map((f) => `{docs}/${f}`)
 		.join("、")}。读的过程中不要输出任何文字，也不要总结内容，读完一个立即读下一个，直到 ${n} 个文件全部读完。${tail}`;
 
-/** 某事件之后是否还出现了 assistant 响应（用来判断中止是否真正阻止了请求）。 */
+/** 一条 assistant 记录是否真的发生了 provider 请求：被本地中止的回合会补记一条 usage 全为 0 的 error 消息，不算请求。 */
+function isRealRequest(r: ProbeRow): boolean {
+	const u = (r.usage ?? {}) as Record<string, number | undefined>;
+	return r.ev === "assistant_end" && (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0) > 0;
+}
+
+/** 某事件首次出现之后，还发生了几次真实的 provider 请求（用来判断中止是否真正阻止了请求）。 */
 function assistantAfter(rows: ProbeRow[], ev: string): { found: boolean; after: number } {
 	const i = rows.findIndex((r) => r.ev === ev);
 	if (i < 0) return { found: false, after: 0 };
-	return { found: true, after: rows.slice(i + 1).filter((r) => r.ev === "assistant_end").length };
+	return { found: true, after: rows.slice(i + 1).filter(isRealRequest).length };
 }
 
 function orderOf(rows: ProbeRow[], evs: string[]): number[] {
@@ -108,6 +114,16 @@ async function rpcPrompt(io: RpcIo, id: string, message: string, timeoutMs = 600
 async function rpcCommand(io: RpcIo, id: string, record: Record<string, unknown>, timeoutMs = 300_000): Promise<Record<string, unknown>> {
 	io.send({ id, ...record });
 	return io.waitFor((r) => r.type === "response" && r.id === id, timeoutMs);
+}
+
+/** 分多次提问、每次读一个文件，让对话有更多请求与切点。中途被中止时停止发送后续提问。 */
+async function sequentialReads(io: RpcIo, docs: string): Promise<void> {
+	for (const [i, f] of DOC_FILES.entries()) {
+		const start = io.records.length;
+		await rpcPrompt(io, `r${i}`, `用 read 工具读取 ${docs}/${f}，读完只回复「已读」两个字。`);
+		const aborted = io.records.slice(start).some((r) => r.type === "message_end" && (r.message as { stopReason?: string } | undefined)?.stopReason === "aborted");
+		if (aborted) return;
+	}
 }
 
 const SMALL = { compaction: { enabled: true, reserveTokens: 32768, keepRecentTokens: 8000 }, contextWindowOverride: 45_000 };
@@ -139,9 +155,7 @@ const SPIKES: SpikeDef[] = [
 		steps: [
 			{
 				// 分 6 次提问、每次读一个文件，对话中才有足够的 user 与 assistant 切点。
-				rpc: async (io, docs) => {
-					for (const [i, f] of DOC_FILES.entries()) await rpcPrompt(io, `r${i}`, `用 read 工具读取 ${docs}/${f}，读完只回复「已读」两个字。`);
-				},
+				rpc: (io, docs) => sequentialReads(io, docs),
 				probeMode: "custom-compact",
 				worst: amounts(20, 50_000),
 			},
@@ -217,7 +231,7 @@ const SPIKES: SpikeDef[] = [
 			const ab = assistantAfter(s4, "probe_abort");
 			const notes = [
 				`步骤 2 事件位置：input ${inp}，session_before_compact ${bc}（原因 ${s2[bc]?.reason ?? "无"}），before_agent_start ${bas}。顺序成立：${ordered}。`,
-				`步骤 4：探针中止 ${ab.found ? "已触发" : "未触发"}，中止之后的 assistant 响应 ${ab.after} 次。`,
+				`步骤 4：探针中止 ${ab.found ? "已触发" : "未触发"}，中止之后的真实请求 ${ab.after} 次。`,
 			];
 			return { pass: ordered && ab.found && ab.after === 0, notes };
 		},
@@ -230,7 +244,7 @@ const SPIKES: SpikeDef[] = [
 		check([s]) {
 			const ab = assistantAfter(s.rows, "probe_abort");
 			const reason = s.rows.find((r) => r.ev === "session_before_compact")?.reason;
-			return { pass: ab.found && ab.after === 0 && reason === "threshold", notes: [`中止：${ab.found}，原因 ${reason}，中止后的 assistant 响应 ${ab.after} 次。`] };
+			return { pass: ab.found && ab.after === 0 && reason === "threshold", notes: [`中止：${ab.found}，原因 ${reason}，中止后的真实请求 ${ab.after} 次。`] };
 		},
 	},
 	{
@@ -238,8 +252,8 @@ const SPIKES: SpikeDef[] = [
 		title: "虚拟模型：阈值按路由到的物理模型窗口判断；在 prepareRequest 中触发的压缩里中止可阻止请求",
 		isolate: { ...SMALL, extraWindowOverrides: [{ provider: "openai-codex", modelId: "gpt-5.6-luna", contextWindow: 60_000 }] },
 		steps: [
-			{ args: ["--model", "probe/auto", "-p", read(6)], probeMode: "virtual", extraEnv: { PROBE_VIRTUAL_TARGETS: "openai-codex/gpt-6-luna,openai-codex/gpt-5.6-luna" }, worst: amounts(20, 50_000) },
-			{ args: ["--model", "probe/auto", "-p", read(6)], probeMode: "virtual,abort-in-compact", extraEnv: { PROBE_VIRTUAL_TARGETS: "openai-codex/gpt-6-luna,openai-codex/gpt-5.6-luna" }, worst: amounts(20, 50_000) },
+			{ extraArgs: ["--model", "probe/auto"], rpc: (io, docs) => sequentialReads(io, docs), probeMode: "virtual", extraEnv: { PROBE_VIRTUAL_TARGETS: "openai-codex/gpt-6-luna,openai-codex/gpt-5.6-luna" }, worst: amounts(20, 50_000) },
+			{ extraArgs: ["--model", "probe/auto"], rpc: (io, docs) => sequentialReads(io, docs), probeMode: "virtual,abort-in-compact", extraEnv: { PROBE_VIRTUAL_TARGETS: "openai-codex/gpt-6-luna,openai-codex/gpt-5.6-luna" }, worst: amounts(20, 50_000) },
 		],
 		check([s8, s10]) {
 			const notes: string[] = [];
@@ -255,18 +269,18 @@ const SPIKES: SpikeDef[] = [
 				});
 			notes.push(`各次压缩：${checks.map((c) => `${c.tokensBefore}（路由窗口 ${c.window}，触发点 ${c.window - 32768}）`).join("；") || "无"}。`);
 			const ab = assistantAfter(s10.rows, "probe_abort");
-			notes.push(`虚拟模型下中止：${ab.found}，中止后的 assistant 响应 ${ab.after} 次。`);
+			notes.push(`虚拟模型下中止：${ab.found}，中止后的真实请求 ${ab.after} 次。`);
 			return { pass: routes.length > 0 && checks.length > 0 && checks.every((c) => c.ok) && ab.found && ab.after === 0, notes };
 		},
 	},
 	{
 		id: "S10d",
-		title: "在 turn_start 调用 ctx.abort() 可阻止该回合的请求",
+		title: "在第 2 个 turn_start 调用 ctx.abort() 可阻止该回合的请求",
 		isolate: SMALL,
-		steps: [{ args: ["-p", read(6)], probeMode: "abort-turn-start:3", worst: amounts(6, 20_000) }],
+		steps: [{ args: ["-p", read(6)], probeMode: "abort-turn-start:2", worst: amounts(6, 20_000) }],
 		check([s]) {
 			const ab = assistantAfter(s.rows, "probe_abort");
-			return { pass: ab.found && ab.after === 0, notes: [`第 3 回合中止：${ab.found}，中止后的 assistant 响应 ${ab.after} 次。`] };
+			return { pass: ab.found && ab.after === 0, notes: [`第 2 回合中止：${ab.found}，中止后的真实请求 ${ab.after} 次。`] };
 		},
 	},
 	{

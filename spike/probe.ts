@@ -3,7 +3,7 @@
 // 环境变量：
 //   - PROBE_LOG：必填，事件日志文件路径，每行一条 JSON，带进程号与会话 id，父子会话写同一个文件。
 //   - PROBE_MODE：逗号分隔的动作列表，可为空：
-//     - abort-in-compact：在 session_before_compact 中先 ctx.abort() 再返回 cancel（S10 路径一）。
+//     - abort-in-compact：在 session_before_compact 中先 ctx.abort() 再返回 cancel，并在随后的 turn_start 再中止一次（方案 7.4 R5 的做法，S10）。
 //     - abort-turn-start:N：在第 N 次 turn_start 调用 ctx.abort()（S10 路径二）。
 //     - custom-compact：自定切点，并用 generateSummaryWithUsage + ctx.modelRegistry.streamSimple 生成摘要（S5、S6）。
 //     - append-in-settle：在 agent_before_settle handler 内用 pi.appendEntry 追加条目，同时返回一条 boundary 草稿（S12）。
@@ -28,6 +28,8 @@ export default function probe(pi: ExtensionAPI): void {
 	const abortAt = [...modes].find((m) => m.startsWith("abort-turn-start:"));
 	const abortTurn = abortAt ? Number(abortAt.split(":")[1]) : undefined;
 	let turnStarts = 0;
+	// 发送新提示词前的压缩检查发生在运行开始之前，此时 ctx.abort() 无事可中止，所以要在随后的 turn_start 补一次。
+	let abortNextTurn = false;
 	let sessionId = "";
 
 	const log = (ev: string, data: Json = {}, ctx?: ExtensionContext) => {
@@ -60,8 +62,9 @@ export default function probe(pi: ExtensionAPI): void {
 	pi.on("turn_start", (_e, ctx) => {
 		turnStarts++;
 		log("turn_start", { n: turnStarts }, ctx);
-		if (abortTurn !== undefined && turnStarts === abortTurn) {
+		if ((abortTurn !== undefined && turnStarts === abortTurn) || abortNextTurn) {
 			log("probe_abort", { at: "turn_start", n: turnStarts }, ctx);
+			abortNextTurn = false;
 			ctx.abort();
 		}
 	});
@@ -93,6 +96,7 @@ export default function probe(pi: ExtensionAPI): void {
 		if (modes.has("abort-in-compact")) {
 			log("probe_abort", { at: "session_before_compact" }, ctx);
 			ctx.abort();
+			abortNextTurn = true;
 			return { cancel: true };
 		}
 		if (!modes.has("custom-compact")) return undefined;
