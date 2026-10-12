@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import budgetGuard, { COMPACTION_MAX_REQUESTS, type GuardState, readGuardLimits, resetGuardState, settle, tryReserve, worstTokensPerRequest } from "../eval/budget-guard.ts";
+import budgetGuard, { COMPACTION_MAX_REQUESTS, type GuardState, readGuardLimits, resetGuardState, settle, tryReserve, usageTokens, worstTokensPerRequest } from "../eval/budget-guard.ts";
 
-const fresh = (): GuardState => ({ requests: 0, billedTokens: 0, pending: new Map() });
+const fresh = (): GuardState => ({ requests: 0, billedTokens: 0, pending: new Map(), overrun: false });
 
 test("readGuardLimits：两项都是正整数才有效", () => {
 	assert.deepEqual(readGuardLimits({ PI_BUDGET_MAX_REQUESTS: "3", PI_BUDGET_MAX_BILLED_TOKENS: "1000" }), { maxRequests: 3, maxBilledTokens: 1000 });
@@ -25,7 +25,7 @@ test("tryReserve：并发的两个会话只能有一个拿到最后一份请求�
 	assert.equal(tryReserve(s, limits, "parent:turn", 1, 100), true);
 	assert.equal(tryReserve(s, limits, "childA:turn", 1, 100), true);
 	assert.equal(tryReserve(s, limits, "childB:turn", 1, 100), false);
-	settle(s, "childA:turn", 1, 10);
+	settle(s, "childA:turn", { requests: 1, tokens: 10 });
 	assert.equal(tryReserve(s, limits, "childB:turn", 1, 100), false, "已结算的请求仍占用请求数");
 });
 
@@ -34,7 +34,7 @@ test("tryReserve：单次最坏 token 超出剩余额度时拒绝，结算后按
 	const limits = { maxRequests: 100, maxBilledTokens: 50_000 };
 	assert.equal(tryReserve(s, limits, "a:turn", 1, 28_000), true);
 	assert.equal(tryReserve(s, limits, "b:turn", 1, 28_000), false, "在途预占合计 56000 超过 50000");
-	settle(s, "a:turn", 1, 2_000);
+	settle(s, "a:turn", { requests: 1, tokens: 2_000 });
 	assert.equal(tryReserve(s, limits, "b:turn", 1, 28_000), true);
 	assert.equal(s.billedTokens, 2_000);
 });
@@ -78,13 +78,14 @@ function load(env: Record<string, string | undefined>, opts: { fresh?: boolean; 
 	};
 }
 
+const FULL = { input: 10, output: 1, cacheRead: 0, cacheWrite: 0 };
 const ENV = { PI_BUDGET_MAX_REQUESTS: "3", PI_BUDGET_MAX_BILLED_TOKENS: "1000000", PI_BUDGET_GUARD_LOG: undefined };
 
 test("扩展：每个回合开始前预占，响应后结算，到上限后中止", () => {
 	const g = load(ENV);
 	for (let i = 0; i < 3; i++) {
 		g.emit("turn_start", {});
-		g.emit("message_end", { message: { role: "assistant", usage: { input: 10 } } });
+		g.emit("message_end", { message: { role: "assistant", usage: FULL } });
 	}
 	assert.equal(g.aborted(), 0);
 	g.emit("turn_start", {});
@@ -96,7 +97,7 @@ test("扩展：父子会话共享计数，并发的两个子会话不能同时�
 	const childA = load(ENV, { fresh: false, session: "a" });
 	const childB = load(ENV, { fresh: false, session: "b" });
 	parent.emit("turn_start", {});
-	parent.emit("message_end", { message: { role: "assistant", usage: { input: 1 } } });
+	parent.emit("message_end", { message: { role: "assistant", usage: FULL } });
 	childA.emit("turn_start", {});
 	childB.emit("turn_start", {});
 	assert.equal(childA.aborted(), 0);
@@ -119,4 +120,55 @@ test("扩展：环境变量缺失或模型窗口未知时第一个回合就中�
 	const g2 = load(ENV, { model: { contextWindow: 0, maxTokens: 0 } });
 	g2.emit("turn_start", {});
 	assert.equal(g2.aborted(), 1);
+});
+
+test("usageTokens：缺失、缺字段、NaN、Infinity、负数都无法核实", () => {
+	assert.equal(usageTokens({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4 }), 10);
+	assert.equal(usageTokens(undefined), undefined);
+	assert.equal(usageTokens({ input: 1, output: 2, cacheRead: 3 }), undefined);
+	assert.equal(usageTokens({ input: Number.NaN, output: 0, cacheRead: 0, cacheWrite: 0 }), undefined);
+	assert.equal(usageTokens({ input: Number.POSITIVE_INFINITY, output: 0, cacheRead: 0, cacheWrite: 0 }), undefined);
+	assert.equal(usageTokens({ input: -1, output: 0, cacheRead: 0, cacheWrite: 0 }), undefined);
+});
+
+test("settle：实际超过预占或无法核实时进入超支状态，此后一律拒绝预占", () => {
+	const limits = { maxRequests: 100, maxBilledTokens: 1_000_000 };
+	const s1 = fresh();
+	tryReserve(s1, limits, "a", 1, 100);
+	assert.equal(settle(s1, "a", { requests: 1, tokens: 101 }), true);
+	assert.equal(tryReserve(s1, limits, "b", 1, 1), false);
+	const s2 = fresh();
+	tryReserve(s2, limits, "a", 1, 100);
+	assert.equal(settle(s2, "a", undefined), true);
+	assert.equal(s2.billedTokens, 100, "无法核实时按预占的最坏值记账");
+	const s3 = fresh();
+	tryReserve(s3, limits, "a", 1, 100);
+	assert.equal(settle(s3, "a", { requests: 1, tokens: 100 }), false, "恰好等于预占不算超支");
+});
+
+test("扩展：usage 不完整的响应按最坏值结算并停止后续请求", () => {
+	const g = load(ENV);
+	g.emit("turn_start", {});
+	g.emit("message_end", { message: { role: "assistant", usage: { input: 1 } } });
+	g.emit("turn_start", {});
+	assert.equal(g.aborted(), 1);
+});
+
+test("扩展：压缩成功但缺少 stats.requests 或 usage 不完整时按最坏值结算并停止；压缩失败只按最坏值记账、不停止", () => {
+	const big = { PI_BUDGET_MAX_REQUESTS: "100", PI_BUDGET_MAX_BILLED_TOKENS: "100000000", PI_BUDGET_GUARD_LOG: undefined };
+	const g1 = load(big);
+	g1.emit("session_before_compact", {});
+	g1.emit("session_compact", { compactionEntry: { usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } } });
+	g1.emit("turn_start", {});
+	assert.equal(g1.aborted(), 1);
+	const g2 = load(big);
+	g2.emit("session_before_compact", {});
+	g2.emit("session_compact", { compactionEntry: { usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, details: { stats: { requests: 2 } } } });
+	g2.emit("turn_start", {});
+	assert.equal(g2.aborted(), 0);
+	const g3 = load(big);
+	g3.emit("session_before_compact", {});
+	g3.emit("session_compact_failed", {});
+	g3.emit("turn_start", {});
+	assert.equal(g3.aborted(), 0);
 });

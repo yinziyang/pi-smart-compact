@@ -53,7 +53,7 @@ interface Scenario {
 	setup?: (session: Session, runtime: ModelRuntime) => Promise<void>;
 	steps: Array<{ prompt: string; autoCompaction?: boolean }>;
 	route(info: RouteInfo): AssistantMessage;
-	check(ctx: { rows: Row[]; entries: Entry[]; seq: string[]; calls: number; guard: Record<string, unknown>[]; childRequests: number }): { pass: boolean; notes: string[] };
+	check(ctx: { rows: Row[]; entries: Entry[]; seq: string[]; calls: number; guard: Record<string, unknown>[]; childRequests: number; childSessions: number }): { pass: boolean; notes: string[] };
 }
 
 function readJsonl(file: string): Record<string, unknown>[] {
@@ -268,10 +268,11 @@ const SCENARIOS: Scenario[] = [
 		factories: async () => [(await import(vendorSubagents())).default as ExtensionFactory],
 		steps: [{ prompt: "同时派两个 subagent 去读文件。" }],
 		route: ({ n }) => (n === 0 ? twoAgents() : read()),
-		check({ calls, guard, childRequests }) {
+		check({ calls, guard, childRequests, childSessions }) {
+			const overlapped = guard.some((g) => Number(g.pendingRequests) >= 1);
 			return {
-				pass: calls <= 2 && guard.length >= 1,
-				notes: [`faux provider 全程调用 ${calls} 次，请求上限 2；子会话 assistant 记录 ${childRequests} 条；守卫拦截 ${guard.length} 次。`],
+				pass: calls === 2 && childSessions === 2 && guard.length >= 1 && overlapped,
+				notes: [`faux provider 全程调用 ${calls} 次，请求上限 2；子会话 ${childSessions} 个，assistant 记录 ${childRequests} 条；守卫拦截 ${guard.length} 次，拦截时有在途预占：${overlapped}。`],
 			};
 		},
 	},
@@ -286,11 +287,12 @@ const SCENARIOS: Scenario[] = [
 		factories: async () => [(await import(vendorSubagents())).default as ExtensionFactory],
 		steps: [{ prompt: "同时派两个 subagent 去读文件。" }],
 		route: ({ n }) => (n === 0 ? twoAgents() : read()),
-		check({ calls, guard }) {
+		check({ calls, guard, childSessions }) {
 			const worst = guard.map((g) => g.worst).filter((w) => w !== undefined);
+			const overlapped = guard.some((g) => Number(g.pendingRequests) >= 1);
 			return {
-				pass: calls <= 2 && guard.length >= 1,
-				notes: [`faux provider 全程调用 ${calls} 次；守卫拦截 ${guard.length} 次，拦截时的单次最坏 token ${worst.join("、") || "无"}；token 上限 50000。`],
+				pass: calls === 2 && childSessions === 2 && guard.length >= 1 && overlapped,
+				notes: [`faux provider 全程调用 ${calls} 次；子会话 ${childSessions} 个；守卫拦截 ${guard.length} 次，拦截时的单次最坏 token ${worst.join("、") || "无"}，拦截时有在途预占：${overlapped}；token 上限 50000。`],
 			};
 		},
 	},
@@ -373,17 +375,21 @@ async function runScenario(sc: Scenario): Promise<boolean> {
 		walk(sessionsDir);
 		const rows = readJsonl(probeLog) as Row[];
 		const childEntries: Entry[] = [];
+		let childSessions = 0;
 		const walkChild = (d: string) => {
 			if (!existsSync(d)) return;
 			for (const x of readdirSync(d, { withFileTypes: true })) {
 				if (x.isDirectory()) walkChild(join(d, x.name));
-				else if (x.name.endsWith(".jsonl")) childEntries.push(...(readJsonl(join(d, x.name)) as Entry[]));
+				else if (x.name.endsWith(".jsonl")) {
+					childSessions++;
+					childEntries.push(...(readJsonl(join(d, x.name)) as Entry[]));
+				}
 			}
 		};
 		walkChild(join(agentDir, "subagent-sessions"));
 		const childRequests = childEntries.filter((e) => e.type === "message" && (e.message as { role?: string }).role === "assistant").length;
 		const guard = readJsonl(join(dir, "guard.jsonl"));
-		const verdict = sc.check({ rows, entries, seq, calls: faux.state.callCount, guard, childRequests });
+		const verdict = sc.check({ rows, entries, seq, calls: faux.state.callCount, guard, childRequests, childSessions });
 		const out = join(COLLAB_DIR, "spike", sc.id);
 		rmSync(out, { recursive: true, force: true });
 		mkdirSync(out, { recursive: true, mode: 0o700 });

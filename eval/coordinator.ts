@@ -146,7 +146,8 @@ export async function withCoordinator<T>(
 		appendRecord(paths.ledgerFile, makeReserve(readLedger(paths.ledgerFile), id, spec.step, spec.worst, new Date().toISOString()));
 
 		const started = Date.now();
-		const child = spawn(spec.piBin ?? "pi", [...spec.args, "-e", GUARD_PATH], {
+		// 守卫放在第一个 -e：它的 session_before_compact 必须先于其他扩展（产生摘要调用的 handler）执行。
+		const child = spawn(spec.piBin ?? "pi", ["-e", GUARD_PATH, ...spec.args], {
 			cwd: spec.cwd,
 			env: {
 				...spec.env,

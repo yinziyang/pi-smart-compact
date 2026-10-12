@@ -28,11 +28,12 @@ function spec(sessions: string, env: Record<string, string>, w: Amounts = worst)
 	return {
 		step: "fake",
 		worst: w,
-		args: [FAKE_PI, "--print", "hi"],
+		// 假脚本带 shebang，直接作为 pi 可执行文件启动；协调脚本会在参数最前面加上 -e <守卫>。
+		args: ["--print", "hi"],
 		env: { PATH: process.env.PATH ?? "", FAKE_SESSION_FILE: join(sessions, "s.jsonl"), ...env },
 		cwd: root,
 		sessionDirs: [sessions],
-		piBin: process.execPath,
+		piBin: FAKE_PI,
 	};
 }
 
@@ -45,7 +46,7 @@ test("预留落盘后启动子进程，结束后按会话文件结算，并传�
 	const seen = JSON.parse(readFileSync(join(sessions, "s.jsonl.env.json"), "utf8"));
 	assert.equal(seen.maxRequests, "3");
 	assert.equal(seen.maxTokens, "1100");
-	assert.deepEqual(seen.args.slice(-2), ["-e", GUARD_PATH]);
+	assert.deepEqual(seen.args.slice(0, 2), ["-e", GUARD_PATH]);
 	const records = readLedger(paths.ledgerFile);
 	assert.deepEqual(records.map((x) => x.type), ["limits", "reserve", "settle"]);
 	assert.equal(spent(records).requests, 2);
@@ -104,7 +105,8 @@ test("drive：通过 stdin 发命令、按 LF 切分 stdout 记录、结束后�
 		(run) =>
 			run({
 				...spec(sessions, {}),
-				args: [FAKE_RPC],
+				args: [],
+				piBin: FAKE_RPC,
 				drive: async (io) => {
 					for (const n of [1, 2]) {
 						const start = io.records.length;
@@ -127,7 +129,7 @@ test("drive 超时：记录 driveError，子进程仍被关闭 stdin 后退出",
 	const { paths, sessions } = fresh();
 	const r = await withCoordinator(
 		"run",
-		(run) => run({ ...spec(sessions, {}), args: [FAKE_RPC], drive: async (io) => void (await io.waitFor((x) => x.type === "never", 200)) }),
+		(run) => run({ ...spec(sessions, {}), args: [], piBin: FAKE_RPC, drive: async (io) => void (await io.waitFor((x) => x.type === "never", 200)) }),
 		paths,
 	);
 	assert.match(r.driveError ?? "", /超时/);

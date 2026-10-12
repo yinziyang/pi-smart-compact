@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // 测试用的假 pi：不调用任何模型，按环境变量的指示写一个会话文件、休眠或直接退出。
 //   FAKE_SESSION_FILE：要写的会话文件路径。
 //   FAKE_REQUESTS：写入几条带 usage 的 assistant 消息，默认 1。

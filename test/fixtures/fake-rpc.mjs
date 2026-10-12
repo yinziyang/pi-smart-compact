@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // 测试用的假 RPC 子进程：逐行读取 stdin 的 JSON 命令，回一条 response；prompt 命令再发一条 agent_settled 事件。
 // stdin 关闭后写一个会话文件（FAKE_SESSION_FILE）并退出，模拟 pi 的有序退出。
 import { writeFileSync } from "node:fs";
