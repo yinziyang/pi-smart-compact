@@ -38,5 +38,9 @@
     "*.ts",
     "!*.test.ts",
     "README.md"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yinziyang/pi-smart-compact.git"
+  }
 }
