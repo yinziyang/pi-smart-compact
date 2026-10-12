@@ -172,3 +172,15 @@ test("扩展：压缩成功但缺少 stats.requests 或 usage 不完整时按最
 	g3.emit("turn_start", {});
 	assert.equal(g3.aborted(), 0);
 });
+
+test("settle：两个并发在途请求都超支时，两次超支都计入，总超支为两者之和", () => {
+	const s = fresh();
+	const limits = { maxRequests: 10, maxBilledTokens: 1_000 };
+	assert.equal(tryReserve(s, limits, "a", 1, 400), true);
+	assert.equal(tryReserve(s, limits, "b", 1, 400), true);
+	settle(s, "a", { requests: 1, tokens: 900 });
+	settle(s, "b", { requests: 1, tokens: 900 });
+	assert.equal(s.overrun, true);
+	assert.equal(s.billedTokens, 1_800, "超出上限 800：等于两个在途请求的超支之和，不止一次请求");
+	assert.equal(tryReserve(s, limits, "c", 1, 1), false);
+});

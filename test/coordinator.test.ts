@@ -135,3 +135,10 @@ test("drive 超时：记录 driveError，子进程仍被关闭 stdin 后退出",
 	assert.match(r.driveError ?? "", /超时/);
 	assert.equal(r.exitCode, 0);
 });
+
+test("含不可观测调用的步骤按无法核实结算，保留全额预留", async () => {
+	const { paths, sessions } = fresh();
+	const r = await withCoordinator("run", (run) => run({ ...spec(sessions, { FAKE_REQUESTS: "1" }), unobservableCalls: true }), paths);
+	assert.equal(r.actual, null);
+	assert.equal(spent(readLedger(paths.ledgerFile)).requests, worst.requests);
+});

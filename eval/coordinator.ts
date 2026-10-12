@@ -56,6 +56,11 @@ export interface StepSpec {
 	/** pi 可执行文件，默认 "pi"（按 env.PATH 查找）。 */
 	piBin?: string;
 	/**
+	 * 为真表示本步骤含有会话文件里看不到的模型调用（例如 pi-goal 评估者的调用），实际用量无法从会话文件完整得到。
+	 * 这类步骤一律按「无法核实」结算，保留全额预留，不按会话文件的部分用量释放。
+	 */
+	unobservableCalls?: boolean;
+	/**
 	 * 可选的交互驱动，用于 RPC 模式：通过 io 向子进程 stdin 发 JSONL 命令、等待 stdout 上的记录。
 	 * drive 结束后协调脚本关闭 stdin，请求子进程有序退出。不提供时 stdin 直接关闭。
 	 */
@@ -223,7 +228,7 @@ export async function withCoordinator<T>(
 		current = undefined;
 		await driving;
 
-		const actual = sumUsage(collectSessionFiles(spec.sessionDirs, started), Date.now() - started);
+		const actual = spec.unobservableCalls ? null : sumUsage(collectSessionFiles(spec.sessionDirs, started), Date.now() - started);
 		const settle = makeSettle(readLedger(paths.ledgerFile), id, actual, new Date().toISOString());
 		if (settle) appendRecord(paths.ledgerFile, settle);
 		return { step: spec.step, reservationId: id, exitCode, timedOut, actual, stdout, stderr, records, driveError: driveError === undefined ? undefined : String(driveError) };
