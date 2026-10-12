@@ -6,7 +6,7 @@
 // 归档内容：每步的 probe-<n>.jsonl、stdout、stderr，全部会话文件，以及 result.json（协调结果与判定）。
 // 判定逻辑写在各 spike 的 check 函数里，只读归档内容，不再调用模型。
 
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -80,10 +80,10 @@ function readJsonl(file: string): Record<string, unknown>[] {
 		.map((l) => JSON.parse(l) as Record<string, unknown>);
 }
 
-const read = (n: number, tail = "全部读完后回复「完成」。") =>
-	`按顺序用 read 工具读取 ${DOC_FILES.slice(0, n)
+const read = (n: number, tail = "全部读完之后只回复「完成」两个字。") =>
+	`这是一个连续任务，必须一次做完：依次调用 read 工具读取下面全部 ${n} 个文件，每次调用只读一个文件：${DOC_FILES.slice(0, n)
 		.map((f) => `{docs}/${f}`)
-		.join("、")} 这 ${n} 个文件，每次只读一个。每读完一个文件只回复「已读」两个字，不要总结内容。${tail}`;
+		.join("、")}。读的过程中不要输出任何文字，也不要总结内容，读完一个立即读下一个，直到 ${n} 个文件全部读完。${tail}`;
 
 /** 某事件之后是否还出现了 assistant 响应（用来判断中止是否真正阻止了请求）。 */
 function assistantAfter(rows: ProbeRow[], ev: string): { found: boolean; after: number } {
@@ -136,7 +136,16 @@ const SPIKES: SpikeDef[] = [
 		id: "S5-S6",
 		title: "自定切点 + generateSummaryWithUsage 经 streamSimple（OAuth）生成摘要，pi 接受并能连续压缩",
 		isolate: SMALL,
-		steps: [{ args: ["-p", read(6)], probeMode: "custom-compact", worst: amounts(20, 50_000) }],
+		steps: [
+			{
+				// 分 6 次提问、每次读一个文件，对话中才有足够的 user 与 assistant 切点。
+				rpc: async (io, docs) => {
+					for (const [i, f] of DOC_FILES.entries()) await rpcPrompt(io, `r${i}`, `用 read 工具读取 ${docs}/${f}，读完只回复「已读」两个字。`);
+				},
+				probeMode: "custom-compact",
+				worst: amounts(20, 50_000),
+			},
+		],
 		check([s]) {
 			const rows = s.rows;
 			const done = rows.filter((r) => r.ev === "probe_custom_done");
@@ -337,6 +346,8 @@ async function main(ids: string[]): Promise<number> {
 			const root = join(process.env.TMPDIR ?? "/tmp", `sc-spike-${def.id}-${Date.now()}`);
 			const iso = createIsolatedEnv({ ...def.isolate, sourceAgentDir: SOURCE_AGENT_DIR, rootDir: root, provider: MODEL.provider, modelId: MODEL.id });
 			const out = join(ARCHIVE_DIR, def.id);
+			// 每次运行前清空本项的归档，避免和上一次运行的会话文件混在一起。
+			rmSync(out, { recursive: true, force: true });
 			mkdirSync(out, { recursive: true, mode: 0o700 });
 			try {
 				const docs = join(iso.projectDir, "docs");

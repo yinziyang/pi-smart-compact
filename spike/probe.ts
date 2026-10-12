@@ -97,17 +97,33 @@ export default function probe(pi: ExtensionAPI): void {
 		}
 		if (!modes.has("custom-compact")) return undefined;
 
-		// S5、S6：在投影上自选切点（保留最后一条 user 消息及之后），用导出的摘要函数生成摘要。
+		// S5、S6：在投影上自选切点。从尾部往前按 chars/4 累计到约 4000 token，取该位置及之后最近的有效切点：
+		// 有效切点是第一条消息为 user 或 assistant 的条目，不切在工具结果上（方案 F13）。
 		const entries = ctx.sessionManager.buildSessionProjection().entries.filter((pe) => pe.sourceEntry.type !== "compaction");
+		const isCut = (i: number) => {
+			const role = entries[i]?.messages[0]?.role;
+			return role === "user" || role === "assistant";
+		};
+		let acc = 0;
 		let cut = -1;
 		for (let i = entries.length - 1; i > 0; i--) {
-			if (entries[i].messages.some((m) => m.role === "user")) {
-				cut = i;
+			acc += Math.ceil(JSON.stringify(entries[i].messages).length / 4);
+			if (acc >= 4000) {
+				for (let j = i; j < entries.length; j++) {
+					if (isCut(j)) {
+						cut = j;
+						break;
+					}
+				}
+				// 之后没有有效切点时，取之前最近的一个（方案 5.2 第 2 步），保留的原文会多一些。
+				for (let j = i - 1; cut < 0 && j > 0; j--) if (isCut(j)) cut = j;
 				break;
 			}
 		}
+		const shape = entries.map((pe, i) => `${i}:${pe.sourceEntry.type}/${pe.messages.map((m) => m.role).join("+") || "-"}/${Math.ceil(JSON.stringify(pe.messages).length / 4)}`);
+		log("probe_custom_shape", { cut, acc, shape }, ctx);
 		if (cut <= 0 || !ctx.model) {
-			log("probe_custom_skip", { cut }, ctx);
+			log("probe_custom_skip", { cut, entries: entries.length }, ctx);
 			return undefined;
 		}
 		const toSummarize = entries.slice(0, cut).flatMap((pe) => pe.messages.filter((m) => m.role !== "system"));
