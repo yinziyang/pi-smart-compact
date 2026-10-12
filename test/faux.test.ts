@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { utf8Bytes } from "../budget.ts";
 import { PACK_CLOSE, PACK_OPEN } from "../pack.ts";
+import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
+import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { goodSummary, readNotes, run, say, type Entry } from "./harness.ts";
 
 /** 连续读 notes.md 直到触发阈值压缩，再给出最终回答。 */
@@ -68,4 +70,172 @@ test("故障注入 all：阈值压缩被取消、运行被中止、进入 R5，�
 	assert.ok(!r.entries.some((e) => e.type === "message" && (e.message as { role?: string; content?: unknown }).role === "user" && JSON.stringify((e.message as { content?: unknown }).content).includes("继续")));
 	const chatsAfterStop = r.requests.filter((q) => !q.summary).length;
 	assert.ok(chatsAfterStop < 30);
+});
+
+const userTexts = (entries: Entry[]) => entries.filter((e) => e.type === "message" && (e.message as { role?: string }).role === "user").map((e) => JSON.stringify((e.message as { content?: unknown }).content));
+const toolResults = (entries: Entry[], name: string) => entries.filter((e) => e.type === "message" && (e.message as { role?: string; toolName?: string }).role === "toolResult" && (e.message as { toolName?: string }).toolName === name).map((e) => JSON.stringify((e.message as { content?: unknown }).content));
+
+test("手动 /compact：参数作为最高优先级侧重点进入唯一一次摘要调用", async () => {
+	const r = await run({
+		steps: ["读 notes.md 几次", async (s) => void (await s.compact("重点保留数据库迁移细节"))],
+		chat: (n) => (n < 6 ? readNotes() : say("好的")),
+	});
+	const c = r.compactions.at(-1)!;
+	assert.equal((c.details as { reason: string }).reason, "manual");
+	const sums = r.requests.filter((q) => q.summary);
+	assert.equal(sums.length, 1);
+	assert.match(sums[0].text, /最高优先级（用户 \/compact 指定）：重点保留数据库迁移细节/);
+});
+
+test("recall_history：压缩后能按关键词与 entryId 取回被摘要部分的原文", async () => {
+	const r = await run({
+		steps: ["暗号是 ZEBRA42，先读 notes.md 多次"],
+		chat: (n) => {
+			if (n < 14) return readNotes();
+			if (n === 14) return fauxAssistantMessage(fauxToolCall("recall_history", { query: "zebra42" }), { stopReason: "toolUse" });
+			return say("暗号是 ZEBRA42");
+		},
+	});
+	assert.ok(r.compactions.length >= 1);
+	const out = toolResults(r.entries, "recall_history");
+	assert.equal(out.length, 1);
+	assert.match(out[0], /ZEBRA42/);
+	assert.match(out[0], /\[[0-9a-f]+\] user/);
+});
+
+test("溢出恢复（length）：被省略的执行记录写进 details.omittedAttempt，并能经 recall_history 取回", async () => {
+	const r = await run({ steps: ["读 notes.md 多次", "写一篇长文"], chat: (n) => {
+			if (n < 6) return readNotes();
+			if (n === 6) return say("已读");
+			if (n === 7) return fauxAssistantMessage(fauxText("这是一段被截断的长文 OMEGA77"), { stopReason: "length" });
+			if (n === 8) return fauxAssistantMessage(fauxToolCall("recall_history", { query: "OMEGA77" }), { stopReason: "toolUse" });
+			return say("完成");
+		} });
+	const c = r.compactions.find((x) => (x.details as { reason?: string }).reason === "overflow");
+	assert.ok(c, `应有 overflow 压缩，实际 ${r.compactions.map((x) => (x.details as { reason?: string }).reason).join(",")}；${r.logs.join(" | ")}`);
+	const om = (c.details as { omittedAttempt?: { records: unknown[] } }).omittedAttempt;
+	assert.ok(om && om.records.length >= 1);
+	const out = toolResults(r.entries, "recall_history");
+	assert.match(out[0] ?? "", /OMEGA77/);
+	assert.match(out[0] ?? "", /溢出恢复省略/);
+});
+
+test("溢出恢复但 pi 没有可压缩的内容：agent_settled 写入恢复条目，带开窗与关窗标记，之后可召回", async () => {
+	const r = await run({ steps: ["读 notes.md 多次", "写一篇长文", "找回刚才的长文"], chat: (n) => {
+			if (n < 2) return readNotes();
+			if (n === 2) return say("已读");
+			if (n === 3) return fauxAssistantMessage(fauxText("这是一段被截断的长文 OMEGA77"), { stopReason: "length" });
+			if (n === 4) return fauxAssistantMessage(fauxToolCall("recall_history", { query: "OMEGA77" }), { stopReason: "toolUse" });
+			return say("完成");
+		} });
+	assert.equal(r.compactions.length, 0);
+	assert.ok(r.entries.some((e) => e.type === "custom" && e.customType === "smart-compact-window"));
+	assert.ok(r.entries.some((e) => e.type === "custom" && e.customType === "smart-compact-window-close"));
+	const recov = r.entries.filter((e) => e.type === "custom" && e.customType === "smart-compact-recovery");
+	assert.equal(recov.length, 1);
+	assert.match(toolResults(r.entries, "recall_history")[0] ?? "", /OMEGA77/);
+});
+
+test("R3：自动压缩次数达上限后进入 R5，之后的普通输入被拦截", async () => {
+	const r = await run({ steps: ["读 notes.md 多次", "第二个问题"], chat: readUntil(14), config: { maxAutoCompactions: 1 } });
+	assert.equal(r.compactions.length, 1);
+	const state = r.entries.filter((e) => e.type === "custom" && e.customType === "smart-compact").at(-1);
+	assert.equal((state?.data as { r5?: { reason: string } }).r5?.reason, "count");
+	assert.ok(!userTexts(r.entries).some((t) => t.includes("第二个问题")));
+});
+
+test("历史被修改：发现失效的那次请求前立即重建，模型看到的是新摘要，重建结果以 compaction 落盘，被删除的内容不进入新摘要", async () => {
+	let edited = false;
+	const editor: ExtensionFactory = (pi) => {
+		pi.on("turn_end", (_e, ctx) => {
+			const branch = ctx.sessionManager.getBranch();
+			if (edited || !branch.some((x) => x.type === "compaction")) return undefined;
+			const first = branch.find((x) => x.type === "message" && (x as { message: { role: string } }).message.role === "user");
+			if (!first) return undefined;
+			edited = true;
+			return { entries: [{ type: "context_edit", targetId: first.id, replacement: null }] };
+		});
+	};
+	const r = await run({ steps: ["机密词 SECRETWORD9，读 notes.md 多次"], chat: readUntil(16), factories: [editor] });
+	assert.ok(edited, "测试扩展应已追加 context_edit");
+	assert.ok(r.entries.some((e) => e.type === "custom" && e.customType === "smart-compact-invalidated"));
+	const rebuilt = r.compactions.find((c) => (c.details as { rebuild?: boolean }).rebuild);
+	assert.ok(rebuilt, r.logs.join(" | "));
+	assert.ok(!String(rebuilt.summary).includes("SECRETWORD9"));
+	const sums = r.requests.filter((q) => q.summary);
+	assert.ok(!sums.at(-1)!.text.includes("SECRETWORD9"), "重建请求不应包含被删除的内容");
+	const state = r.entries.filter((e) => e.type === "custom" && e.customType === "smart-compact").at(-1);
+	assert.equal((state?.data as { r5?: unknown }).r5 ?? null, null);
+	// 重建之后发给主模型的请求都不含被删除的内容，也不含旧摘要。
+	const rebuildAt = r.requests.lastIndexOf(sums.at(-1)!);
+	const after = r.requests.slice(rebuildAt + 1).filter((q) => !q.summary);
+	assert.ok(after.length >= 1);
+	assert.ok(after.every((q) => !q.all.includes("SECRETWORD9")));
+});
+
+test("历史被修改且重建失败：进入 R5，模型只看到固定短通知，之后的输入被拦截", async () => {
+	let edited = false;
+	const editor: ExtensionFactory = (pi) => {
+		pi.on("turn_end", (_e, ctx) => {
+			const branch = ctx.sessionManager.getBranch();
+			if (edited || !branch.some((x) => x.type === "compaction")) return undefined;
+			const first = branch.find((x) => x.type === "message" && (x as { message: { role: string } }).message.role === "user");
+			if (!first) return undefined;
+			edited = true;
+			return { entries: [{ type: "context_edit", targetId: first.id, replacement: null }] };
+		});
+	};
+	let sums = 0;
+	const r = await run({ steps: ["机密词 SECRETWORD9，读 notes.md 多次", "继续"], chat: readUntil(16), factories: [editor], summary: (_n, req) => (sums++ === 0 ? goodSummary(req) : say("坏")) });
+	const state = r.entries.filter((e) => e.type === "custom" && e.customType === "smart-compact").at(-1);
+	assert.equal((state?.data as { r5?: { reason: string } }).r5?.reason, "history");
+	assert.ok(!userTexts(r.entries).some((t) => t.includes("继续")));
+	assert.equal(r.compactions.filter((c) => (c.details as { rebuild?: boolean }).rebuild).length, 0);
+});
+
+test("被 context_edit 删除的工具结果不进入摘要请求、压缩包、交接文档与召回结果", async () => {
+	const deleter: ExtensionFactory = (pi) => {
+		pi.on("turn_end", (e) => {
+			const text = JSON.stringify(e.toolResults);
+			if (!text.includes("DELETEME")) return undefined;
+			return { entries: e.toolResultEntryIds.map((id) => ({ type: "context_edit" as const, targetId: id, replacement: null })) };
+		});
+	};
+	const r = await run({
+		steps: ["先执行 echo，再读 notes.md 多次"],
+		chat: (n) => {
+			if (n === 0) return fauxAssistantMessage(fauxToolCall("bash", { command: "echo DELETEME" }), { stopReason: "toolUse" });
+			if (n < 15) return readNotes();
+			if (n === 15) return fauxAssistantMessage(fauxToolCall("recall_history", { query: "DELETEME" }), { stopReason: "toolUse" });
+			return say("完成");
+		},
+		factories: [deleter],
+	});
+	assert.ok(r.compactions.length >= 1);
+	assert.ok(r.entries.some((e) => e.type === "context_edit"), "测试扩展应已删除 echo 的结果");
+	assert.ok(r.requests.some((q) => !q.summary && q.all.includes("DELETEME")), "删除之前模型应见过它，否则本用例不成立");
+	// 命令本身在 assistant 的工具调用里，只检查被删除的输出行（echo 的结果原文以换行结尾）。
+	const leaked = (s: string) => /DELETEME\\n|"text":"DELETEME/.test(s) || s.split("\n").some((l) => l.trim() === "DELETEME");
+	assert.ok(r.requests.filter((q) => q.summary).every((q) => !leaked(q.text)));
+	assert.ok(r.handoffTexts.every((t) => !t.split("\n").some((l) => l.trim() === "│ DELETEME" || l.trim() === "DELETEME")));
+	assert.ok(!toolResults(r.entries, "recall_history").some((t) => /toolResult\(bash\)/.test(t)));
+});
+
+test("脱敏：送给摘要模型的输入、交接文档与召回结果都不含密钥原文", async () => {
+	const key = ["sk-", "abcdefghijklmnop1234"].join("");
+	const r = await run({
+		steps: [`配置里的密钥是 ${key}，读 notes.md 多次`],
+		chat: (n) => {
+			if (n < 14) return readNotes();
+			if (n === 14) return fauxAssistantMessage(fauxToolCall("recall_history", { query: "密钥" }), { stopReason: "toolUse" });
+			return say("完成");
+		},
+	});
+	assert.ok(r.compactions.length >= 1);
+	assert.ok(r.requests.filter((q) => q.summary).every((q) => !q.text.includes(key)));
+	assert.ok(r.handoffTexts.every((t) => !t.includes(key)));
+	assert.ok(r.compactions.every((c) => !JSON.stringify(c).includes(key)));
+	const out = toolResults(r.entries, "recall_history");
+	assert.match(out[0] ?? "", /已脱敏/);
+	assert.ok(!out[0]?.includes(key));
 });

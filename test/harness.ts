@@ -8,6 +8,8 @@ import { createAgentSession, DefaultResourceLoader, type ExtensionFactory, Model
 import { PACK_CLOSE, PACK_OPEN } from "../pack.ts";
 import { realDeps, smartCompact, VERIFIED_PI_VERSION } from "../index.ts";
 
+export type Session = Awaited<ReturnType<typeof createAgentSession>>["session"];
+
 export type Entry = Record<string, unknown> & { type?: string; id?: string; customType?: string; details?: Record<string, unknown>; message?: Record<string, unknown> };
 
 export const GOOD_NARRATIVE = [
@@ -31,6 +33,8 @@ export interface Request {
 	summary: boolean;
 	/** 最后一条消息的文本（摘要请求即整段提示词）。 */
 	text: string;
+	/** 全部消息的文本，用于检查模型实际看到了什么。 */
+	all: string;
 	lastRole: string;
 }
 
@@ -40,7 +44,8 @@ export interface RunOptions {
 	config?: Record<string, unknown>;
 	env?: Record<string, string>;
 	factories?: ExtensionFactory[];
-	steps: string[];
+	/** 每一步是一条提示词，或一个直接操作会话的函数（例如手动压缩）。 */
+	steps: (string | ((session: Session) => Promise<void>))[];
 	/** 普通对话请求的脚本，n 为该类请求的序号（从 0 开始）。 */
 	chat: (n: number, req: Request) => AssistantMessage;
 	/** 摘要请求的脚本，缺省为回填合格的叙述与压缩包。 */
@@ -120,7 +125,8 @@ export async function run(o: RunOptions): Promise<RunResult & { handoffTexts: st
 				const last = context.messages[context.messages.length - 1];
 				const sys = context.messages.find((m) => m.role === "system");
 				const summary = `${context.systemPrompt ?? ""}${textOf(sys?.content)}`.includes("context summarization assistant");
-				const req: Request = { n: requests.length, summary, text: textOf(last?.content), lastRole: last?.role ?? "" };
+				const all = context.messages.map((m) => textOf(m.content) || JSON.stringify(m)).join("\n");
+				const req: Request = { n: requests.length, summary, text: textOf(last?.content), all, lastRole: last?.role ?? "" };
 				requests.push(req);
 				if (summary) return (o.summary ?? ((_n: number, r: Request) => goodSummary(r)))(summaries++, req);
 				return o.chat(chats++, req);
@@ -133,7 +139,8 @@ export async function run(o: RunOptions): Promise<RunResult & { handoffTexts: st
 		const { session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model, resourceLoader: loader, sessionManager: SessionManager.create(cwd, sessionsDir) });
 		await session.bindExtensions({ mode: "print" });
 		for (const step of o.steps) {
-			await session.prompt(step);
+			if (typeof step === "string") await session.prompt(step);
+			else await step(session);
 			await session.agent.waitForIdle();
 		}
 		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });

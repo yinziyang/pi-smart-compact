@@ -122,8 +122,35 @@ export function initialFEst(systemPrompt: string, tools: readonly { name: string
 	return estC(systemPrompt) + tools.reduce((a, t) => a + estC(JSON.stringify({ n: t.name, d: t.description, g: t.promptGuidelines, p: t.parameters })), 0);
 }
 
+/** 一次压缩请求：来自 session_before_compact，或来自历史被修改后的重建（方案 5.2 第 4 步）。 */
+export interface CompactRequest {
+	reason: SessionBeforeCompactEvent["reason"];
+	willRetry: boolean;
+	/** pi 合并 modelOverrides 后对该模型生效的值。 */
+	settings: { reserveTokens: number; keepRecentTokens: number };
+	tokensBefore: number;
+	branchEntries: readonly RawEntry[];
+	/** 自定切点前没有消息时改用的切点。 */
+	fallbackFirstKept: string;
+	customInstructions?: string;
+	signal: AbortSignal;
+}
+
+export function requestFromEvent(e: SessionBeforeCompactEvent): CompactRequest {
+	return {
+		reason: e.reason,
+		willRetry: e.willRetry,
+		settings: e.preparation.settings,
+		tokensBefore: e.preparation.tokensBefore,
+		branchEntries: e.branchEntries as unknown as RawEntry[],
+		fallbackFirstKept: e.preparation.firstKeptEntryId,
+		customInstructions: e.customInstructions,
+		signal: e.signal,
+	};
+}
+
 export interface CompactInput {
-	event: SessionBeforeCompactEvent;
+	event: CompactRequest;
 	ctx: ExtensionContext;
 	config: Config;
 	choice: ModelChoice;
@@ -171,13 +198,13 @@ export function handoffDoc(title: string, narrative: string | undefined, data: P
 export async function runCompaction(input: CompactInput): Promise<CompactOutcome> {
 	const { event, ctx, config, choice, modelState, fEst, omitted, rebuild, handoffPath, nonce, fault, now } = input;
 	const started = now();
-	const settings = event.preparation.settings;
+	const settings = event.settings;
 	const T = choice.window - settings.reserveTokens;
 	const overflowRetry = event.reason === "overflow" && event.willRetry;
 	const budget = computeBudget({ T, keepRecentTokens: settings.keepRecentTokens, level: modelState.budgetLevel, mode: choice.mode, fEst, overflowRetry });
 	if (!budget.ok && event.reason === "threshold") return { kind: "invariant", budget, T };
 
-	const branch = event.branchEntries as unknown as RawEntry[];
+	const branch = event.branchEntries;
 	const applied = applyEdits(branch);
 	const c = modelState.c;
 
@@ -188,11 +215,11 @@ export async function runCompaction(input: CompactInput): Promise<CompactOutcome
 		.map((pe) => ({ id: pe.sourceEntry.id, messages: pe.messages.filter((m) => m.role !== "system") }))
 		.filter((pe) => pe.messages.length > 0);
 	const cutEntries: CutEntry[] = projected.map((pe) => ({ id: pe.id, roles: pe.messages.map((m) => m.role), est: estC(serialize(pe.messages), c) }));
-	const cut = chooseCut(cutEntries, budget.K, event.preparation.firstKeptEntryId);
+	const cut = chooseCut(cutEntries, budget.K, event.fallbackFirstKept);
 	const keptIds = new Set(cut ? projected.slice(cut.index).map((pe) => pe.id) : []);
 
 	const data = extractPack({ entries: applied, keptIds, omitted: omitted?.records ?? [], handoffPath });
-	const statsExtra = { reason: event.reason, tokensBefore: event.preparation.tokensBefore, T, budget };
+	const statsExtra = { reason: event.reason, tokensBefore: event.tokensBefore, T, budget };
 	const earlyHandoff = handoffDoc("smart-compact 交接文档（压缩进行中）", undefined, data, statsExtra);
 	if (!cut) return { kind: "failed", error: "找不到可用的切点", handoff: earlyHandoff };
 
@@ -310,5 +337,5 @@ export async function runCompaction(input: CompactInput): Promise<CompactOutcome
 		modelKey: choice.key,
 	};
 	const handoff = handoffDoc("smart-compact 交接文档", res.narrative, data, { ...statsExtra, stats: details.stats, fallback: res.fallback, mainError: res.ok ? res.mainError : undefined, bEst: details.bEst });
-	return { kind: "ok", result: { summary, firstKeptEntryId: cut.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore, usage: sumUsage(res.stats), details }, handoff };
+	return { kind: "ok", result: { summary, firstKeptEntryId: cut.firstKeptEntryId, tokensBefore: event.tokensBefore, usage: sumUsage(res.stats), details }, handoff };
 }

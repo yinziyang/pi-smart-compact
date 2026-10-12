@@ -12,10 +12,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { VERSION, type ExtensionAPI, type ExtensionContext, type SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { applyBaseline, applyDensity, computeBudget, countAutoCompactions, freshModelState, isOwnCompaction, type ModelState } from "./budget.ts";
-import { chooseModel, handoffDoc, initialFEst, isVirtual, modelKey, runCompaction, type OwnDetails } from "./compact.ts";
+import { chooseModel, handoffDoc, initialFEst, isVirtual, modelKey, requestFromEvent, runCompaction, type OwnDetails } from "./compact.ts";
 import { applyEdits, contentText, findInvalidation, messageText, toolCalls, type RawEntry } from "./edits.ts";
 import { extractPack, type RecoveryRecord } from "./pack.ts";
 import { recallById, recallByQuery, validRecoveryRecords, type RecallDoc } from "./recall.ts";
@@ -78,7 +78,12 @@ interface Runtime {
 	pendingSample: PendingSample | null;
 	/** 等待在安全时机追加的 custom 条目。 */
 	pendingCustom: { customType: string; data: unknown }[];
-	rebuildTried: boolean;
+	/** 已尝试过重建的 compaction id，每次失效只尝试一次。 */
+	rebuiltFor: string | null;
+	/** 已记录失效的 compaction id。 */
+	invalidatedId: string | null;
+	/** 重建得到、等待以边界条目追加的 compaction。 */
+	pendingDraft: { forId: string; draft: SessionBoundaryDraft } | null;
 	/** 历史被修改时最早的失效编辑的时间，用于清理更早的交接文档。 */
 	invalidatedAt: number | null;
 	/** 当前模型的预算窗口来自声明值时，记下它供 message_end 校验。 */
@@ -87,7 +92,7 @@ interface Runtime {
 }
 
 function freshRuntime(): Runtime {
-	return { state: freshState(), dirty: false, scan: rec.freshScanState(), windowId: null, abortNextTurn: false, inflight: false, returned: null, batchNonce: null, pendingSample: null, pendingCustom: [], rebuildTried: false, invalidatedAt: null, declaredWindow: null, notified: new Set() };
+	return { state: freshState(), dirty: false, scan: rec.freshScanState(), windowId: null, abortNextTurn: false, inflight: false, returned: null, batchNonce: null, pendingSample: null, pendingCustom: [], rebuiltFor: null, invalidatedId: null, pendingDraft: null, invalidatedAt: null, declaredWindow: null, notified: new Set() };
 }
 
 function branchOf(ctx: ExtensionContext): RawEntry[] {
@@ -199,7 +204,7 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		const data = extractPack({ entries: applyEdits(branchOf(ctx)), keptIds: new Set(), omitted: pending, handoffPath: path });
 		const ok = writeHandoff(ctx, r, path, handoffDoc(`smart-compact 交接文档（自动压缩已停止：${R5_TEXT[reason]}）`, undefined, data, { reason }));
 		const where = ok ? `请用交接文档 ${path} 开新会话` : "请开新会话";
-		const exit = reason === "history" ? "空闲时会自动重建" : "或执行 /smart-compact reset";
+		const exit = reason === "history" ? "或执行 /compact 手动重建" : "或执行 /smart-compact reset";
 		tell(ctx, `自动压缩已停止：${R5_TEXT[reason]}。${where}，${exit}。`, "error");
 		updateStatus(ctx, r);
 	};
@@ -291,30 +296,118 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		}
 	});
 
-	pi.on("context", (e, ctx) => {
+	/** 检测最新摘要是否因历史被修改而失效；首次发现某个 compaction 失效时记下失效条目（方案 5.2 第 4 步）。 */
+	const detectInvalidation = (ctx: ExtensionContext, r: Runtime) => {
+		const branch = branchOf(ctx);
+		const inv = findInvalidation(branch);
+		if (inv && r.invalidatedId !== inv.compactionId) {
+			r.invalidatedId = inv.compactionId;
+			const edit = branch.find((x) => x.id === inv.editId);
+			r.invalidatedAt = Date.parse(edit?.timestamp ?? "") || deps.now();
+			r.pendingCustom.push({ customType: INVALIDATED_TYPE, data: { version: 1, compactionId: inv.compactionId, editId: inv.editId } });
+		}
+		return inv;
+	};
+
+	/**
+	 * 历史被修改后的重建：从应用了编辑的原始分支重新生成摘要，结果以边界条目（turn_end 或 agent_before_settle）追加为新的 compaction。
+	 * 不走 ctx.compact()：pi 的手动压缩在最近一次压缩之后内容很少时会以「Nothing to compact」拒绝。
+	 * 也不等到运行结束：被中止的运行不会触发 agent_before_settle（agent-session.js 的 _runAgentPrompt），所以在发现失效的那次 context 事件里同步重建，本次请求直接使用新摘要。
+	 * 返回 "aborted" 表示被用户中止，不算失败，下一次请求会重试。
+	 */
+	const rebuild = async (ctx: ExtensionContext, r: Runtime, signal: AbortSignal): Promise<SessionBoundaryDraft | "failed" | "aborted"> => {
+		const branch = branchOf(ctx);
+		const choice = chooseModel(ctx, branch, config);
+		if (!choice) {
+			tell(ctx, "smart-compact：重建失败：找不到可用的摘要模型。", "error");
+			return "failed";
+		}
+		const latest = [...branch].reverse().find((x) => x.type === "compaction");
+		const cs = pi.getSettings().compaction;
+		const ms = modelStateFor(r, choice.key);
+		const handoffPath = nextHandoffPath(ctx);
+		const out = await runCompaction({
+			event: {
+				reason: "manual",
+				willRetry: false,
+				settings: { reserveTokens: cs?.reserveTokens ?? 16384, keepRecentTokens: cs?.keepRecentTokens ?? 20000 },
+				tokensBefore: ctx.getContextUsage()?.tokens ?? 0,
+				branchEntries: branch,
+				fallbackFirstKept: latest?.firstKeptEntryId ?? "",
+				signal,
+			},
+			ctx,
+			config,
+			choice,
+			modelState: ms,
+			fEst: ms.fEst ?? initialFEst(ctx.getSystemPrompt(), activeTools()),
+			omitted: null,
+			rebuild: true,
+			handoffPath,
+			nonce: deps.randomId(),
+			fault: fault(),
+			now: deps.now,
+		});
+		if (signal.aborted) return "aborted";
+		if (out.kind !== "ok") {
+			if (out.kind === "failed") writeHandoff(ctx, r, handoffPath, out.handoff ?? "");
+			tell(ctx, `smart-compact：重建失败：${out.kind === "failed" ? out.error : "预算不满足不变量"}。`, "error");
+			return "failed";
+		}
+		if (!writeHandoff(ctx, r, handoffPath, out.handoff)) out.result.details.handoffPath = undefined;
+		if (r.state.r5?.reason === "history") exitR5(ctx, r);
+		removeHandoffsBefore(ctx, r, out.result.details.handoffPath);
+		const { summary, firstKeptEntryId, details, usage } = out.result;
+		return { type: "compaction", summary, firstKeptEntryId, details, usage };
+	};
+
+	/**
+	 * 处理失效：已有待落盘的重建结果时直接用它；本次失效还没尝试过重建时立即重建；重建失败进入 R5（历史被修改）。
+	 * 返回应替换进模型上下文的摘要文本。
+	 */
+	const handleInvalidation = async (ctx: ExtensionContext, r: Runtime, signal: AbortSignal): Promise<string | null> => {
+		const inv = detectInvalidation(ctx, r);
+		if (!inv) return r.state.r5?.reason === "history" ? INVALID_NOTICE : null;
+		if (r.pendingDraft?.forId === inv.compactionId) return r.pendingDraft.draft.type === "compaction" ? r.pendingDraft.draft.summary : INVALID_NOTICE;
+		if (r.rebuiltFor === inv.compactionId || !takeover()) {
+			if (!r.state.r5) enterR5(ctx, r, "history");
+			return INVALID_NOTICE;
+		}
+		const out = await rebuild(ctx, r, signal);
+		if (out === "aborted") return INVALID_NOTICE;
+		r.rebuiltFor = inv.compactionId;
+		if (out === "failed") {
+			enterR5(ctx, r, "history");
+			return INVALID_NOTICE;
+		}
+		r.pendingDraft = { forId: inv.compactionId, draft: out };
+		return out.type === "compaction" ? out.summary : INVALID_NOTICE;
+	};
+
+	pi.on("context", async (e, ctx) => {
 		const r = rt(ctx);
-		const replace = (messages: AgentMessage[]) => messages.map((m) => (m.role === "compactionSummary" ? { ...m, summary: INVALID_NOTICE } : m));
+		const replace = (messages: AgentMessage[], summary: string) => messages.map((m) => (m.role === "compactionSummary" ? { ...m, summary } : m));
 		try {
-			const branch = branchOf(ctx);
-			const inv = findInvalidation(branch);
-			if (inv && r.state.r5?.reason !== "history") {
-				const edit = branch.find((x) => x.id === inv.editId);
-				r.invalidatedAt = Date.parse(edit?.timestamp ?? "") || deps.now();
-				r.rebuildTried = false;
-				r.pendingCustom.push({ customType: INVALIDATED_TYPE, data: { version: 1, compactionId: inv.compactionId, editId: inv.editId } });
-				enterR5(ctx, r, "history");
-			}
-			if (inv || r.state.r5?.reason === "history") return { messages: replace(e.messages) };
-			return undefined;
+			const summary = await handleInvalidation(ctx, r, ctx.signal ?? new AbortController().signal);
+			return summary === null ? undefined : { messages: replace(e.messages, summary) };
 		} catch {
-			return { messages: replace(e.messages) };
+			return { messages: replace(e.messages, INVALID_NOTICE) };
 		}
 	});
 
+	/** 取出待追加的边界条目：失效记录与重建得到的 compaction。 */
+	const takeBoundary = (r: Runtime): SessionBoundaryDraft[] => {
+		const entries: SessionBoundaryDraft[] = r.pendingCustom.splice(0).map((c) => ({ type: "custom" as const, customType: c.customType, data: c.data }));
+		if (r.pendingDraft) {
+			entries.push(r.pendingDraft.draft);
+			r.pendingDraft = null;
+		}
+		return entries;
+	};
+
 	pi.on("turn_end", (_e, ctx) => {
-		const r = rt(ctx);
-		if (r.pendingCustom.length === 0) return undefined;
-		return { entries: r.pendingCustom.splice(0).map((c) => ({ type: "custom" as const, customType: c.customType, data: c.data })) };
+		const entries = takeBoundary(rt(ctx));
+		return entries.length ? { entries } : undefined;
 	});
 
 	pi.on("message_end", (e, ctx) => {
@@ -392,9 +485,17 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		}
 	};
 	pi.on("agent_start", (_e, ctx) => closeWindow(ctx));
-	pi.on("agent_before_settle", (_e, ctx) => {
+	pi.on("agent_before_settle", async (_e, ctx) => {
 		closeWindow(ctx);
-		return undefined;
+		const r = rt(ctx);
+		// 运行的最后一个回合之后才出现的失效编辑，在这里重建；运行已结束，用独立的中止信号，资源上限仍由 MAX_REQUESTS 与 MAX_WALL_MS 约束。
+		try {
+			await handleInvalidation(ctx, r, new AbortController().signal);
+		} catch (err) {
+			tell(ctx, `smart-compact：重建出错：${err instanceof Error ? err.message : String(err)}`, "error");
+		}
+		const entries = takeBoundary(r);
+		return entries.length ? { entries } : undefined;
 	});
 
 	const writeRecovery = (r: Runtime, nonce: string) => {
@@ -411,11 +512,6 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		r.scan.seen.clear();
 		flushCustom(r);
 		persist(r);
-		// 历史被修改后在空闲时自动重建，每次失效只尝试一次（方案 5.2 第 4 步）。
-		if (r.state.r5?.reason === "history" && !r.rebuildTried && takeover()) {
-			r.rebuildTried = true;
-			ctx.compact({ onError: (err) => tell(ctx, `smart-compact：重建失败：${err.message}。请用交接文档开新会话。`, "error") });
-		}
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
@@ -478,7 +574,7 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 				writeHandoff(ctx, r, handoffPath, handoffDoc("smart-compact 交接文档（溢出恢复，压缩前）", undefined, data, { reason: event.reason }));
 			}
 			const nonce = deps.randomId();
-			const out = await runCompaction({ event, ctx, config, choice, modelState: ms, fEst, omitted: batch, rebuild, handoffPath, nonce, fault: fault(), now: deps.now });
+			const out = await runCompaction({ event: requestFromEvent(event), ctx, config, choice, modelState: ms, fEst, omitted: batch, rebuild, handoffPath, nonce, fault: fault(), now: deps.now });
 			if (event.signal.aborted) return undefined;
 			if (out.kind === "invariant") return stop("baseline");
 			if (out.kind === "failed") {
