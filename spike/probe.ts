@@ -41,6 +41,11 @@ export default function probe(pi: ExtensionAPI): void {
 		}
 	};
 
+	pi.registerCommand("probe-cmd", {
+		description: "spike 用的探针命令，只记录一次调用",
+		handler: async (_args, ctx) => log("probe_cmd", {}, ctx),
+	});
+
 	pi.on("session_start", (_e, ctx) => {
 		sessionId = ctx.sessionManager.getSessionId();
 		log("session_start", { model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null, modelWindow: ctx.model?.contextWindow ?? null }, ctx);

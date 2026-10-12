@@ -22,6 +22,8 @@ export interface IsolateOptions {
 	compaction: { enabled: boolean; reserveTokens: number; keepRecentTokens: number };
 	/** 设置时，用 modelOverrides 把被测模型的 contextWindow 改成该值。 */
 	contextWindowOverride?: number;
+	/** 其他模型的窗口覆盖，例如虚拟模型的第二个路由目标。 */
+	extraWindowOverrides?: Array<{ provider: string; modelId: string; contextWindow: number }>;
 	/** 隔离配置 packages 中安装的本地扩展路径，例如 smart-compact、pi-goal、pi-subagents。 */
 	packages?: string[];
 	/** 额外透传给子进程的环境变量，例如本扩展的测试开关。 */
@@ -92,6 +94,7 @@ export function createIsolatedEnv(opts: IsolateOptions): IsolatedEnv {
 
 	let models = readJsonObject(join(opts.sourceAgentDir, "models.json"));
 	if (opts.contextWindowOverride !== undefined) models = withWindowOverride(models, opts.provider, opts.modelId, opts.contextWindowOverride);
+	for (const o of opts.extraWindowOverrides ?? []) models = withWindowOverride(models, o.provider, o.modelId, o.contextWindow);
 	writePrivateJson(join(agentDir, "models.json"), models);
 
 	const store = join(opts.sourceAgentDir, "models-store.json");
