@@ -66,9 +66,9 @@ function fillerText(n: number): string {
 	return `${lines.join("\n")}\n`;
 }
 
-/** 每个合成文件里 END 标记行的校验码。 */
+/** 每个合成文件里 END 标记行的校验码：由哈希生成，没有可推算的规律（实测 agent 会从几个样本推出等差规律后跳过读取）。 */
 export function endCode(n: number): string {
-	return String(((n * 48271) % 899_999) + 100_000);
+	return String((Number.parseInt(createHash("sha256").update(`sc-it-${n}`).digest("hex").slice(0, 8), 16) % 900_000) + 100_000);
 }
 
 /** 隔离项目里的测试材料：合成文本文件、带大量键值的 secret.txt、可以 npm test 的最小项目、test/ 目录。返回合成文件的路径列表。 */
@@ -257,8 +257,8 @@ const CASES: CaseDef[] = [
 			const list = c.docs.slice(0, GOAL_FILES);
 			c.extra.list = list.map((f) => f.split("/").at(-1));
 			// 完成证据是最后一次 npm test 的输出，不依赖逐个文件的读取证据：那些证据会随压缩移出上下文，评估者无法据此核实。
-			await rpcPrompt(io, "w", `接下来的任务：用 read 工具逐个读取下面 ${list.length} 个文件的全文（每次只读一个；不要用 bash 的 grep、tail、head、cat、sed 等读取或搜索这些文件），在每个文件中间找到以 END 开头的那一行（形如 END part-NN code=XXXXXX）。把这 ${list.length} 行按文件顺序写入 ${join(c.project, "notes", "result.txt")}，然后在 ${c.project} 运行 npm test 检查，失败就修正后重跑。文件：${list.join("、")}。先只回复「收到」。`);
-			await rpcPrompt(io, "g", `/goal 在 ${c.project} 运行 npm test 的输出为 all tests passed，且最后一条回复贴出了这次 npm test 的完整输出。`);
+			await rpcPrompt(io, "w", `接下来的任务：用 read 工具逐个读取下面 ${list.length} 个文件的全文（每次只读一个；不要用 bash 的 grep、tail、head、cat、sed 等读取或搜索这些文件），在每个文件中间找到以 END 开头的那一行（形如 END part-NN code=XXXXXX）。把这 ${list.length} 行按文件顺序写入 ${join(c.project, "notes", "result.txt")}，然后在 ${c.project} 运行 npm test 检查，失败就修正 result.txt 后重跑；不得修改 check.js 与 package.json。文件：${list.join("、")}。先只回复「收到」。`);
+			await rpcPrompt(io, "g", `/goal 在 ${c.project} 运行 npm test 的输出为 all tests passed，且最后一条回复贴出了这次 npm test 的完整输出；过程中没有修改 check.js 与 package.json，并且只用 read 工具读取了这些 part 文件（没有用 bash 读取或搜索它们）。`);
 			c.extra.ended = await waitSession(io, c.sessionDir, (e) => e.some((x) => x.customType === "pi-goal" && (x.data as { type?: string }).type === "end"), 40 * 60_000);
 		},
 		check(c, entries, result) {
