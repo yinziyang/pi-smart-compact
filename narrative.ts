@@ -124,7 +124,11 @@ export function checkStructure(narrative: string): string[] {
 	return missing;
 }
 
+// 侧重点。回放评测（方案 12.3）第一轮的修订：摘要常把较早的失败写得最突出而漏掉最后一次失败，Next Steps 也常停在较早的状态，所以明确要求按时间以对话末尾为准。
 const BASE_FOCUS = [
+	"Constraints & Preferences 逐条列出用户提出的全部约束与偏好，保留原话中的关键限定词。",
+	"Progress 与 Next Steps 以对话末尾的最新状态为准；已经完成的写明已完成。",
+	"在 Critical Context 中写明对话里时间上最后一次失败（不是最早的那次）、它的原因，以及是否已经解决。",
 	"保留失败过的方案与失败原因。",
 	"写清验证状态：用什么命令验证、结果如何、哪些尚未验证。",
 	"原样保留路径、函数名、错误原文。",
