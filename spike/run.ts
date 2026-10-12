@@ -44,6 +44,8 @@ interface StepDef {
 	compactionEnabled?: boolean;
 	extraArgs?: string[];
 	extraEnv?: Record<string, string>;
+	/** 为真时不加 -ne，改由隔离配置的 packages 加载扩展（含探针），用于验证子会话是否加载。 */
+	viaPackages?: boolean;
 	worst: Amounts;
 }
 
@@ -286,7 +288,7 @@ const SPIKES: SpikeDef[] = [
 	{
 		id: "S12",
 		title: "长度恢复：恢复省略编辑出现在 agent_end 之后、agent_before_settle 之前；agent_before_settle 内 appendEntry 早于 boundary 条目",
-		isolate: { compaction: { enabled: true, reserveTokens: 6000, keepRecentTokens: 4000 }, contextWindowOverride: 30_000 },
+		isolate: { compaction: { enabled: true, reserveTokens: 2000, keepRecentTokens: 4000 }, contextWindowOverride: 24_000 },
 		steps: [
 			{
 				args: ["-p", read(4, "全部读完后，写一篇不少于两万字的中文长文，逐段复述这些文档的内容，必须写满两万字，不要提前结束。")],
@@ -313,6 +315,40 @@ const SPIKES: SpikeDef[] = [
 			const draft = entries.findIndex((e) => e.type === "custom" && e.customType === "probe-boundary-draft");
 			notes.push(`appendEntry 条目位置 ${marker}，boundary 草稿位置 ${draft}；前者更早：${marker >= 0 && draft > marker}。`);
 			return { pass: lengthIdx >= 0 && editsInWindow && marker >= 0 && draft > marker, notes };
+		},
+	},
+	{
+		id: "S14",
+		title: "openai-codex 是否执行摘要调用的 maxTokens（请求 64，要求写长文）",
+		isolate: SMALL,
+		steps: [{ rpc: (io, docs) => sequentialReads(io, docs), probeMode: "summary-cap", worst: amounts(20, 50_000, 4_000) }],
+		check([s]) {
+			const res = s.rows.filter((r) => r.ev === "probe_cap_result");
+			const errs = s.rows.filter((r) => r.ev === "probe_cap_error");
+			const notes = [
+				`成功返回 ${res.length} 次：${res.map((r) => `输出 ${r.outputTokens} token、${r.chars} 字符`).join("；") || "无"}。`,
+				`抛错 ${errs.length} 次：${errs.map((r) => String(r.error).slice(0, 120)).join("；") || "无"}。`,
+			];
+			const enforced = res.length + errs.length > 0 && res.every((r) => Number(r.outputTokens) <= 64);
+			notes.push(`provider 执行了 maxTokens：${enforced}。`);
+			// 本项是事实探查，无论结果如何都记录为「已完成」，结论由人工据此修改方案。
+			return { pass: res.length + errs.length > 0, notes };
+		},
+	},
+	{
+		id: "S13b",
+		title: "经隔离配置 packages 安装的扩展（探针）是否在 pi-subagents 子会话中加载",
+		isolate: { ...SMALL, packages: [PROBE, PI_SUBAGENTS] },
+		steps: [
+			{
+				viaPackages: true,
+				args: ["-p", "使用 agent 工具派一个 subagent_type 为 general-purpose 的 subagent，run_in_background 为 false，让它用 read 工具读取 {docs}/models.md，读完只回复「子已读」。你收到结果后只回复「完成」。"],
+				worst: amounts(10, 30_000),
+			},
+		],
+		check([s]) {
+			const sessions = [...new Set(s.rows.map((r) => r.session).filter(Boolean))];
+			return { pass: sessions.length >= 2, notes: [`探针看到的会话 ${sessions.length} 个。经 packages 安装时子会话加载了扩展：${sessions.length >= 2}。`] };
 		},
 	},
 	{
@@ -378,7 +414,8 @@ async function main(ids: string[]): Promise<number> {
 					}
 					const probeLog = join(root, `probe-${i + 1}.jsonl`);
 					const mode = step.rpc ? ["--mode", "rpc"] : [];
-					const args = [...BASE_FLAGS, ...mode, "--session-dir", sessionDir, "-e", PROBE, ...(step.extraArgs ?? []), ...(step.args ?? []).map((a) => a.replaceAll("{docs}", docs))];
+					const flags = step.viaPackages ? BASE_FLAGS.filter((f) => f !== "-ne") : [...BASE_FLAGS, "-e", PROBE];
+					const args = [...flags, ...mode, "--session-dir", sessionDir, ...(step.extraArgs ?? []), ...(step.args ?? []).map((a) => a.replaceAll("{docs}", docs))];
 					const env = { ...iso.env, PROBE_LOG: probeLog, PROBE_MODE: step.probeMode ?? "", ...(step.extraEnv ?? {}) };
 					const result = await runStep({
 						step: `${def.id}#${i + 1}`,

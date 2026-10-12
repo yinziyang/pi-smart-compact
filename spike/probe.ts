@@ -7,6 +7,7 @@
 //     - abort-turn-start:N：在第 N 次 turn_start 调用 ctx.abort()（S10 路径二）。
 //     - custom-compact：自定切点，并用 generateSummaryWithUsage + ctx.modelRegistry.streamSimple 生成摘要（S5、S6）。
 //     - append-in-settle：在 agent_before_settle handler 内用 pi.appendEntry 追加条目，同时返回一条 boundary 草稿（S12）。
+//     - summary-cap：在 session_before_compact 中用 maxTokens=64 请求一段要求很长的摘要，记录实际输出 token 与结束原因，然后交回 pi 默认处理（S14）。
 //     - virtual：注册虚拟模型 probe/auto，按请求次数在 PROBE_VIRTUAL_TARGETS 列出的两个物理模型之间交替路由（S8）。
 // 这个扩展只用于 spike，不进入正式实现。
 
@@ -57,7 +58,7 @@ export default function probe(pi: ExtensionAPI): void {
 		return { action: "continue" };
 	});
 	pi.on("before_agent_start", (_e, ctx) => log("before_agent_start", {}, ctx));
-	pi.on("agent_start", (_e, ctx) => log("agent_start", {}, ctx));
+	pi.on("agent_start", (_e, ctx) => log("agent_start", { leaf: ctx.sessionManager.getLeafId() }, ctx));
 	pi.on("agent_end", (_e, ctx) => log("agent_end", { leaf: ctx.sessionManager.getLeafId() }, ctx));
 	pi.on("turn_start", (_e, ctx) => {
 		turnStarts++;
@@ -98,6 +99,16 @@ export default function probe(pi: ExtensionAPI): void {
 			ctx.abort();
 			abortNextTurn = true;
 			return { cancel: true };
+		}
+		if (modes.has("summary-cap") && ctx.model) {
+			const msgs = ctx.sessionManager.buildSessionProjection().messages.filter((m) => m.role !== "system").slice(0, 6);
+			try {
+				const r = await generateSummaryWithUsage(msgs, ctx.model, 80, undefined, undefined, event.signal, "无论上面的格式要求如何，都必须写不少于两千字，逐条详细展开。", undefined, "off", (m, c, o) => ctx.modelRegistry.streamSimple(m, c, o));
+				log("probe_cap_result", { requestedMaxTokens: 64, outputTokens: (r.usage as { output?: number } | undefined)?.output ?? null, chars: r.text.length }, ctx);
+			} catch (err) {
+				log("probe_cap_error", { requestedMaxTokens: 64, error: err instanceof Error ? err.message : String(err) }, ctx);
+			}
+			return undefined;
 		}
 		if (!modes.has("custom-compact")) return undefined;
 
