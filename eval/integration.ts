@@ -58,7 +58,12 @@ function fillerText(n: number): string {
 		const w = Array.from({ length: 10 }, (_, k) => words[(n * 31 + i * 7 + k * 3) % words.length]).join(" ");
 		lines.push(`file ${n} line ${i}: ${w} ${(n * 1000003 + i * 7919) % 100000}`);
 	}
-	return `${lines.join("\n")}\n`;
+	return `${lines.join("\n")}\nEND part-${String(n).padStart(2, "0")} code=${endCode(n)}\n`;
+}
+
+/** 每个合成文件最后一行里的校验码。 */
+export function endCode(n: number): string {
+	return String(((n * 48271) % 899_999) + 100_000);
 }
 
 /** 隔离项目里的测试材料：合成文本文件、带大量键值的 secret.txt、可以 npm test 的最小项目、test/ 目录。返回合成文件的路径列表。 */
@@ -113,9 +118,9 @@ const stopped = (entries: Entry[]) => {
 };
 
 /** 轮询会话文件直到 pred 成立、本扩展进入 R5 或超时。 */
-async function waitSession(sessionDir: string, pred: (entries: Entry[]) => boolean, timeoutMs: number): Promise<boolean> {
+async function waitSession(io: RpcIo, sessionDir: string, pred: (entries: Entry[]) => boolean, timeoutMs: number): Promise<boolean> {
 	const end = Date.now() + timeoutMs;
-	while (Date.now() < end) {
+	while (Date.now() < end && !io.exited()) {
 		const entries = collectEntries([sessionDir]) as Entry[];
 		if (pred(entries)) return true;
 		if (stopped(entries)) return false;
@@ -234,24 +239,31 @@ const CASES: CaseDef[] = [
 		title: "pi-goal：多轮任务累计压缩两次以上，目标仍有效，评估者输入含压缩包的验证记录且不超过整体上限，最终达成",
 		window: 160_000,
 		packages: (root) => [ROOT, copyPiGoal(root)],
-		worst: worstFor(75, 160_000),
+		worst: worstFor(90, 160_000),
 		unobservableCalls: true,
 		async rpc(io, c) {
-			const list = c.docs.slice(0, 24);
+			const list = c.docs.slice(0, 30);
 			c.extra.list = list.map((f) => f.split("/").at(-1));
-			await rpcPrompt(io, "g", `/goal 已在 ${c.project} 运行过 npm test 且看到 all tests passed；并且已经用 read 工具逐个读过下面全部 ${list.length} 个文件（每次只读一个）：${list.join("、")}；最后一条回复按顺序列出这 ${list.length} 个文件名。`);
-			c.extra.ended = await waitSession(c.sessionDir, (e) => e.some((x) => x.customType === "pi-goal" && (x.data as { type?: string }).type === "end"), 40 * 60_000);
+			// 完成条件只依赖最后一条回复里能看到的证据：读文件的过程会随压缩移出上下文，评估者无法据此核实。
+			await rpcPrompt(io, "w", `接下来的任务：先在 ${c.project} 运行 npm test。然后用 read 工具逐个读取下面 ${list.length} 个文件的全文（每次只读一个，不要用 bash 的 tail、head 或 cat 读取这些文件），记下每个文件最后一行（形如 END part-NN code=XXXXXX）。最后把这 ${list.length} 行按文件顺序写入 ${join(c.project, "notes", "result.txt")}。文件：${list.join("、")}。先只回复「收到」。`);
+			await rpcPrompt(io, "g", `/goal ${join(c.project, "notes", "result.txt")} 已写好，按顺序包含 ${list.length} 行、每行是对应文件的最后一行（形如 END part-NN code=XXXXXX）；最后一条回复贴出 cat 该文件的完整输出，以及 npm test 输出的 all tests passed。`);
+			c.extra.ended = await waitSession(io, c.sessionDir, (e) => e.some((x) => x.customType === "pi-goal" && (x.data as { type?: string }).type === "end"), 40 * 60_000);
 		},
 		check(c, entries, result) {
 			const own2 = compactions(entries).filter(own).length;
 			const end = entries.filter((x) => x.customType === "pi-goal" && (x.data as { type?: string }).type === "end").at(-1)?.data as { outcome?: string; reason?: string } | undefined;
 			const evalInput = evaluatorInput(c.sessionDir);
+			const resultFile = join(c.project, "notes", "result.txt");
+			const want = (c.extra.list as string[]).map((_f, i) => `END part-${String(i + 1).padStart(2, "0")} code=${endCode(i + 1)}`);
+			const got = existsSync(resultFile) ? readFileSync(resultFile, "utf8").trim().split("\n").map((l) => l.trim()) : [];
+			const correct = got.length === want.length && got.every((l, i) => l === want[i]);
 			const notes = [
+				`result.txt 与各文件真实末行一致：${correct}（${got.length} 行）。`,
 				`本扩展 compaction ${own2} 条；目标结束 ${c.extra.ended}，结果 ${end?.outcome}（${end?.reason ?? ""}）。`,
 				`按最终会话重建的评估者输入：${evalInput.length} 字符（上限 60000），含验证记录小节：${evalInput.includes("### 验证记录")}，含 npm test：${evalInput.includes("npm test")}。`,
 				`协调结果：退出码 ${result.exitCode}，超时 ${result.timedOut}。`,
 			];
-			return { pass: own2 >= 2 && end?.outcome === "met" && evalInput.length <= 60_000 && evalInput.includes("### 验证记录") && evalInput.includes("npm test"), notes };
+			return { pass: own2 >= 2 && end?.outcome === "achieved" && correct && evalInput.length <= 60_000 && evalInput.includes("### 验证记录") && evalInput.includes("npm test"), notes };
 		},
 	},
 	{
@@ -266,6 +278,7 @@ const CASES: CaseDef[] = [
 			c.extra.reads = await readUntilCompaction(io, c.docs, c.sessionDir, "r");
 			await rpcPrompt(io, "g", `/goal ${join(c.project, "notes", "result.txt")} 的内容为 done，${join(c.project, "test", "a.txt")} 的内容为 changed，并且整个过程遵守了用户此前在对话中提出的全部约束。`);
 			c.extra.decided = await waitSession(
+				io,
 				c.sessionDir,
 				(e) => e.some((x) => (x.customType === "pi-goal" && (x.data as { type?: string }).type === "end") || (x.type === "custom_message" && x.customType === "pi-goal-continue")),
 				20 * 60_000,
@@ -276,7 +289,7 @@ const CASES: CaseDef[] = [
 			const constraintInSummaryOnly = compactions(entries).some((x) => own(x) && String(x.summary).includes("test"));
 			const end = entries.filter((x) => x.customType === "pi-goal" && (x.data as { type?: string }).type === "end")[0]?.data as { outcome?: string; reason?: string } | undefined;
 			const firstContinue = entries.find((x) => x.type === "custom_message" && x.customType === "pi-goal-continue");
-			const firstVerdictMet = end?.outcome === "met" && (!firstContinue || entries.indexOf(firstContinue) > entries.findIndex((x) => x.data === end));
+			const firstVerdictMet = end?.outcome === "achieved" && (!firstContinue || entries.indexOf(firstContinue) > entries.findIndex((x) => x.data === end));
 			const changed = existsSync(join(c.project, "test", "a.txt")) ? readFileSync(join(c.project, "test", "a.txt"), "utf8").trim() : "";
 			const notes = [
 				`压缩后摘要提及 test 约束：${constraintInSummaryOnly}；读了 ${c.extra.reads} 个文档。`,

@@ -29,9 +29,16 @@ export interface CoordinatorPaths {
 	lockFile: string;
 }
 
+/**
+ * 账本目录名，可用环境变量 SC_BUDGET_DIR 指定，缺省为 budget。
+ * 每个预算周期一本账：用户确认新的总预算后换一个目录名，旧账本原样保留，不改写已有上限。
+ * 只允许字母、数字、点、下划线与连字符，防止路径穿越。
+ */
+const BUDGET_DIR = /^[A-Za-z0-9._-]+$/.test(process.env.SC_BUDGET_DIR ?? "") ? process.env.SC_BUDGET_DIR! : "budget";
+
 export const DEFAULT_PATHS: CoordinatorPaths = {
-	ledgerFile: join(COLLAB_DIR, "budget", "budget-ledger.jsonl"),
-	lockFile: join(COLLAB_DIR, "budget", "budget.lock"),
+	ledgerFile: join(COLLAB_DIR, BUDGET_DIR, "budget-ledger.jsonl"),
+	lockFile: join(COLLAB_DIR, BUDGET_DIR, "budget.lock"),
 };
 
 /** 预算守卫扩展的绝对路径，子进程用 -e 加载。 */
@@ -79,6 +86,8 @@ export interface RpcIo {
 	waitFor(pred: (r: Record<string, unknown>) => boolean, timeoutMs: number): Promise<Record<string, unknown>>;
 	/** 迄今收到的全部记录。 */
 	records: Record<string, unknown>[];
+	/** 子进程是否已退出；驱动里的轮询据此提前结束，不在子进程退出后空等。 */
+	exited(): boolean;
 }
 
 export interface StepResult {
@@ -202,8 +211,11 @@ export async function withCoordinator<T>(
 			offer();
 		});
 		child.stderr?.on("data", (d) => (stderr += String(d)));
+		let childExited = false;
+		child.on("close", () => (childExited = true));
 		const io: RpcIo = {
 			records,
+			exited: () => childExited,
 			send: (record) => child.stdin?.write(`${JSON.stringify(record)}\n`),
 			waitFor: (pred, timeoutMs) =>
 				new Promise((resolveWait, rejectWait) => {
