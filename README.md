@@ -21,7 +21,7 @@ git clone /tmp/pi-smart-compact ~/.pi/agent/.collab/smart-compact/pi-smart-compa
 pi install ~/.pi/agent/.collab/smart-compact/pi-smart-compact
 ```
 
-更新时在该目录执行 `git pull`，再重启 pi。
+更新时在该目录从开发仓库拉取（例如 `git pull /tmp/pi-smart-compact main`），再重启 pi；开发仓库不在时，这份克隆本身就是完整的仓库，可以直接在其中修改与提交。
 
 同时在 `settings.json` 中打开 pi 的自动压缩，建议值如下：
 

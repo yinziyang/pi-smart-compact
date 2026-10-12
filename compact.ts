@@ -8,7 +8,7 @@ import type { Usage } from "@earendil-works/pi-ai";
 import type { ExtensionContext, SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
 import { computeBudget, estC, utf8Bytes, type Budget, type ModelState, type PackMode } from "./budget.ts";
 import { chooseCut, type CutEntry } from "./cut.ts";
-import { applyEdits, messageText, toolCalls, type RawEntry, type RawMessage } from "./edits.ts";
+import { applyEdits, type RawBlock, type RawEntry } from "./edits.ts";
 import { summarize, type Generate, type SummaryStats } from "./narrative.ts";
 import { handoffDoc } from "./handoff.ts";
 import { extractPack, renderFull, renderLocal, renderModelData, truncateBytes, type RecoveryRecord } from "./pack.ts";
@@ -119,17 +119,27 @@ function serialize(msgs: AgentMessage[]): string {
 	return serializeConversation(convertToLlm(msgs));
 }
 
-/** 消息的完整文本：正文、思考、工具调用参数与工具结果全文，不做任何截断，用于估算原样保留的内容。 */
+/**
+ * 保留区内容的完整文本，用于估算原样发给模型的部分。
+ * 先经 convertToLlm 对齐模型实际可见的内容（例如过滤 excludeFromContext 的 bash 输出、加上 bash 状态与摘要包装文本），再取全部文本块、thinking、工具调用参数与工具结果全文。
+ * 不用 serializeConversation：它会把工具结果截到 2000 字符（方案 F9），会严重低估读文件等大块结果。
+ */
 export function fullText(msgs: readonly AgentMessage[]): string {
-	return msgs
-		.map((m) => {
-			const raw = m as unknown as RawMessage;
-			const blocks = Array.isArray(raw.content) ? raw.content : [];
-			const thinking = blocks.filter((b) => b.type === "thinking").map((b) => b.thinking ?? "");
-			const calls = toolCalls(raw).map((c) => `${c.name} ${JSON.stringify(c.args)}`);
-			return [messageText(raw), ...thinking, ...calls].join("\n");
-		})
-		.join("\n");
+	const parts: string[] = [];
+	for (const m of convertToLlm([...msgs])) {
+		const content = (m as { content?: unknown }).content;
+		if (typeof content === "string") {
+			parts.push(content);
+			continue;
+		}
+		if (!Array.isArray(content)) continue;
+		for (const b of content as RawBlock[]) {
+			if (b.type === "text") parts.push(b.text ?? "");
+			else if (b.type === "thinking") parts.push(b.thinking ?? "");
+			else if (b.type === "toolCall") parts.push(`${b.name ?? ""} ${JSON.stringify(b.arguments ?? {})}`);
+		}
+	}
+	return parts.join("\n");
 }
 
 /** 初始固定开销：system prompt 加活动工具 schema 的估算（方案 7.3）。 */
