@@ -8,7 +8,7 @@
 //   - openai-codex 走 OAuth 订阅，实际消耗的是订阅额度，这里的美元数只是按公开价目折算的参考。
 // 回放样本从本地会话中挑选：峰值上下文不低于 120k，排除评审会话本身，截断点不超过默认模型的触发点。
 //
-// 命令行：node eval/preview.ts [--json <输出文件>]
+// 命令行：node eval/preview.ts [--model provider/id] [--json <输出文件>]
 
 import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -18,13 +18,15 @@ import type { Amounts, Limits } from "./ledger.ts";
 
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 
-/** 默认被测模型：价目已知、窗口 272k。 */
-const TEST_MODEL = { provider: "openai-codex", id: "gpt-6.1-sol", window: 272_000 };
+/** 被测模型，可用 --model provider/id 指定；窗口取 models-store.json 中的 contextWindow。用户指定的默认值为 gpt-6-luna。 */
+const DEFAULT_MODEL = "openai-codex/gpt-6-luna";
 /** 建议的触发余量（方案 4.2）。 */
 const RESERVE = 32_768;
-const TEST_TRIGGER = TEST_MODEL.window - RESERVE;
-/** 压缩后基线上界，按不变量 0.55 × T 估。 */
-const POST_BASELINE = Math.round(0.55 * TEST_TRIGGER);
+/** 由被测模型窗口推出的触发点与压缩后基线上界（不变量 0.55 × T）。 */
+function triggerOf(window: number): { trigger: number; postBaseline: number } {
+	const trigger = window - RESERVE;
+	return { trigger, postBaseline: Math.round(0.55 * trigger) };
+}
 /** 每次请求的墙钟时间上界，单位毫秒。 */
 const WALL_PER_REQUEST = 90_000;
 
@@ -55,11 +57,13 @@ interface Row extends Item {
 	typicalCost: number | null;
 }
 
-function loadPrices(): Map<string, Price> {
+function loadPrices(): { prices: Map<string, Price>; windows: Map<string, number> } {
 	const prices = new Map<string, Price>();
-	const store = JSON.parse(readFileSync(join(AGENT_DIR, "models-store.json"), "utf8")) as Record<string, { models?: Array<{ id: string; cost?: Record<string, unknown> }> }>;
+	const windows = new Map<string, number>();
+	const store = JSON.parse(readFileSync(join(AGENT_DIR, "models-store.json"), "utf8")) as Record<string, { models?: Array<{ id: string; contextWindow?: unknown; cost?: Record<string, unknown> }> }>;
 	for (const [provider, entry] of Object.entries(store)) {
 		for (const m of entry.models ?? []) {
+			if (typeof m.contextWindow === "number") windows.set(`${provider}/${m.id}`, m.contextWindow);
 			const c = m.cost as { input?: number; output?: number; cacheRead?: number; tiers?: Array<{ inputTokensAbove: number; input: number; output: number; cacheRead: number }> } | undefined;
 			if (!c || typeof c.input !== "number" || typeof c.output !== "number") continue;
 			const tier = c.tiers?.[0];
@@ -74,7 +78,7 @@ function loadPrices(): Map<string, Price> {
 			});
 		}
 	}
-	return prices;
+	return { prices, windows };
 }
 
 /** 单次请求的费用，单位美元；cacheShare 为输入中按缓存价计的比例。 */
@@ -140,8 +144,7 @@ export function findReplayCandidates(sessionsDir: string, trigger: number, limit
 	return out.sort((a, b) => b.peak - a.peak).slice(0, limit);
 }
 
-export function buildItems(candidates: Candidate[]): Item[] {
-	const M = `${TEST_MODEL.provider}/${TEST_MODEL.id}`;
+export function buildItems(candidates: Candidate[], M: string, postBaseline: number): Item[] {
 	const items: Item[] = [
 		{ phase: "P0", name: "S1 原生窗口触发（测试窗口 160k）", model: M, requests: 40, avgIn: 100_000, avgOut: 3_000 },
 		{ phase: "P0", name: "S5 摘要调用链", model: M, requests: 3, avgIn: 60_000, avgOut: 8_000 },
@@ -170,14 +173,14 @@ export function buildItems(candidates: Candidate[]): Item[] {
 			items.push(
 				{ phase, name: `${name} 压缩 A/B/C`, model: M, requests: 2 + 3 + 2, avgIn: c.size, avgOut: 16_000 },
 				{ phase, name: `${name} 答题 O`, model: M, requests: 6, avgIn: c.size, avgOut: 2_000 },
-				{ phase, name: `${name} 答题 A/B/C`, model: M, requests: 18, avgIn: POST_BASELINE, avgOut: 2_000 },
+				{ phase, name: `${name} 答题 A/B/C`, model: M, requests: 18, avgIn: postBaseline, avgOut: 2_000 },
 				{ phase, name: `${name} 评判`, model: M, requests: 6, avgIn: 20_000, avgOut: 2_000 },
 			);
 		}
 	};
 	replay("回放", "回放");
 	items.push(
-		{ phase: "回放", name: "128k 样本（gpt-5.3-codex-spark 自动触发）", model: "openai-codex/gpt-5.3-codex-spark", requests: 50, avgIn: 70_000, avgOut: 3_000 },
+		{ phase: "回放", name: "128k 样本（被测模型，窗口覆盖为 128k，自动触发）", model: M, requests: 50, avgIn: 70_000, avgOut: 3_000 },
 		{ phase: "1M（可跳过）", name: "1M 合成样本 压缩 B", model: M, requests: 3, avgIn: 950_000, avgOut: 16_000, optional: true },
 		{ phase: "1M（可跳过）", name: "1M 合成样本 答题 O", model: M, requests: 6, avgIn: 950_000, avgOut: 2_000, optional: true },
 		{ phase: "1M（可跳过）", name: "1M 合成样本 答题 B 与评判", model: M, requests: 12, avgIn: 80_000, avgOut: 2_000, optional: true },
@@ -203,12 +206,20 @@ function sum(rows: Row[]): { amounts: Amounts; worst: number | null; typical: nu
 }
 
 function main(argv: string[]): number {
-	const prices = loadPrices();
-	const candidates = findReplayCandidates(join(AGENT_DIR, "sessions"), TEST_TRIGGER);
-	const rows = buildItems(candidates).map((i) => toRow(i, prices));
+	const modelIdx = argv.indexOf("--model");
+	const model = modelIdx >= 0 && argv[modelIdx + 1] ? argv[modelIdx + 1] : DEFAULT_MODEL;
+	const { prices, windows } = loadPrices();
+	const window = windows.get(model);
+	if (!window) {
+		process.stderr.write(`models-store.json 中找不到模型或其窗口：${model}\n`);
+		return 1;
+	}
+	const { trigger, postBaseline } = triggerOf(window);
+	const candidates = findReplayCandidates(join(AGENT_DIR, "sessions"), trigger);
+	const rows = buildItems(candidates, model, postBaseline).map((i) => toRow(i, prices));
 	const phases = [...new Set(rows.map((r) => r.phase))];
 	const lines: string[] = [];
-	lines.push(`被测模型：${TEST_MODEL.provider}/${TEST_MODEL.id}，触发点 ${TEST_TRIGGER}，压缩后基线上界 ${POST_BASELINE}。`);
+	lines.push(`被测模型：${model}，窗口 ${window}，触发点 ${trigger}，压缩后基线上界 ${postBaseline}。`);
 	lines.push(`回放样本 ${candidates.length} 个：${candidates.map((c) => `${Math.round(c.peak / 1000)}k→截断 ${Math.round(c.size / 1000)}k（原模型 ${c.model}）`).join("；")}`);
 	lines.push("");
 	lines.push("| 阶段 | 请求 | 输入 token | 输出 token | 墙钟上界 | 最坏费用 | 典型费用 |");
