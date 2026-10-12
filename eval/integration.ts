@@ -9,6 +9,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, write
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { COLLAB_DIR, GUARD_PATH, type RpcIo, type StepResult, withCoordinator } from "./coordinator.ts";
 import { assertAuthFresh, createIsolatedEnv } from "./isolate.ts";
@@ -25,6 +26,8 @@ const ARCHIVE_DIR = join(COLLAB_DIR, "integration");
 const MODEL = { provider: "openai-codex", id: "gpt-6-luna" };
 const FLAGS = ["-nc", "-ns", "-np", "--no-themes", "--no-mcp"];
 const RESERVE = 32768;
+/** T-goal 要处理的文件数。 */
+const GOAL_FILES = 30;
 /** gpt-6-luna 的 maxTokens 与价目（models-store.json），单位 token 与美元每百万 token。 */
 const MAX_TOKENS = 128_000;
 const PRICE = { input: 0.1, output: 0.5 };
@@ -69,13 +72,20 @@ export function endCode(n: number): string {
 }
 
 /** 隔离项目里的测试材料：合成文本文件、带大量键值的 secret.txt、可以 npm test 的最小项目、test/ 目录。返回合成文件的路径列表。 */
-function prepareProject(project: string): string[] {
+export function prepareProject(project: string): string[] {
 	const docs = join(project, "docs");
 	mkdirSync(docs, { recursive: true });
 	for (let i = 1; i <= 30; i++) writeFileSync(join(docs, `part-${String(i).padStart(2, "0")}.txt`), fillerText(i));
 	const lines = Array.from({ length: 300 }, (_, i) => `key_${i} = ${((i * 7919 + 104729) % 900000) + 100000}`);
 	writeFileSync(join(project, "secret.txt"), `${lines.join("\n")}\n`);
-	writeFileSync(join(project, "package.json"), JSON.stringify({ name: "it-project", private: true, scripts: { test: "node -e \"console.log('all tests passed')\"" } }, null, 2));
+	// npm test 校验 notes/result.txt：内容等于前 GOAL_FILES 个文件的 END 行时才输出 all tests passed。脚本里只存哈希，读脚本拿不到答案。
+	const expected = Array.from({ length: GOAL_FILES }, (_, i) => `END part-${String(i + 1).padStart(2, "0")} code=${endCode(i + 1)}`).join("\n");
+	const hash = createHash("sha256").update(expected).digest("hex");
+	writeFileSync(
+		join(project, "check.js"),
+		`const fs=require("fs");const c=require("crypto");let t="";try{t=fs.readFileSync("notes/result.txt","utf8").trim().split("\\n").map(l=>l.trim()).join("\\n")}catch{}\nif(c.createHash("sha256").update(t).digest("hex")==="${hash}"){console.log("all tests passed")}else{console.log("FAILED: notes/result.txt 与期望不符");process.exit(1)}\n`,
+	);
+	writeFileSync(join(project, "package.json"), JSON.stringify({ name: "it-project", private: true, scripts: { test: "node check.js" } }, null, 2));
 	mkdirSync(join(project, "test"), { recursive: true });
 	writeFileSync(join(project, "test", "a.txt"), "original\n");
 	mkdirSync(join(project, "notes"), { recursive: true });
@@ -144,8 +154,6 @@ interface CaseDef {
 	id: string;
 	title: string;
 	window?: number;
-	/** 额外的 pi 参数，例如 --tools。 */
-	extraArgs?: string[];
 	/** packages 加载的扩展（守卫自动放在第一项）；为空时用 -ne 加 -e 加载本扩展。 */
 	packages?: (root: string) => string[];
 	worst: Amounts;
@@ -243,16 +251,14 @@ const CASES: CaseDef[] = [
 		title: "pi-goal：多轮任务累计压缩两次以上，目标仍有效，评估者输入含压缩包的验证记录且不超过整体上限，最终达成",
 		window: 160_000,
 		packages: (root) => [ROOT, copyPiGoal(root)],
-		extraArgs: ["--tools", "read,write,recall_history"],
 		worst: worstFor(150, 160_000),
 		unobservableCalls: true,
 		async rpc(io, c) {
-			const list = c.docs.slice(0, 30);
+			const list = c.docs.slice(0, GOAL_FILES);
 			c.extra.list = list.map((f) => f.split("/").at(-1));
-			// 验证记录来自用户经 RPC 执行的 npm test（bashExecution）；agent 只有 read、write 与 recall_history，无法用 grep 或 tail 绕过全文读取。
-			await rpcCommand(io, "b", { type: "bash", command: "npm test" }, 120_000);
-			await rpcPrompt(io, "w", `接下来的任务：用 read 工具逐个读取下面 ${list.length} 个文件的全文（每次只读一个），在每个文件里找到以 END 开头的那一行（形如 END part-NN code=XXXXXX，位置在文件中间，不在末尾）。最后把这 ${list.length} 行按文件顺序写入 ${join(c.project, "notes", "result.txt")}。文件：${list.join("、")}。先只回复「收到」。`);
-			await rpcPrompt(io, "g", `/goal ${join(c.project, "notes", "result.txt")} 已写好，按顺序包含 ${list.length} 行，每行是对应文件中以 END 开头的那一行；最后一条回复贴出该文件写入时的完整内容。`);
+			// 完成证据是最后一次 npm test 的输出，不依赖逐个文件的读取证据：那些证据会随压缩移出上下文，评估者无法据此核实。
+			await rpcPrompt(io, "w", `接下来的任务：用 read 工具逐个读取下面 ${list.length} 个文件的全文（每次只读一个；不要用 bash 的 grep、tail、head、cat、sed 等读取或搜索这些文件），在每个文件中间找到以 END 开头的那一行（形如 END part-NN code=XXXXXX）。把这 ${list.length} 行按文件顺序写入 ${join(c.project, "notes", "result.txt")}，然后在 ${c.project} 运行 npm test 检查，失败就修正后重跑。文件：${list.join("、")}。先只回复「收到」。`);
+			await rpcPrompt(io, "g", `/goal 在 ${c.project} 运行 npm test 的输出为 all tests passed，且最后一条回复贴出了这次 npm test 的完整输出。`);
 			c.extra.ended = await waitSession(io, c.sessionDir, (e) => e.some((x) => x.customType === "pi-goal" && (x.data as { type?: string }).type === "end"), 40 * 60_000);
 		},
 		check(c, entries, result) {
@@ -365,7 +371,7 @@ async function main(ids: string[]): Promise<number> {
 				const result = await runStep({
 					step: def.id,
 					worst: def.worst,
-					args: [...loadArgs, ...(def.extraArgs ?? []), ...mode, "--session-dir", sessionDir, ...(def.args?.(c) ?? [])],
+					args: [...loadArgs, ...mode, "--session-dir", sessionDir, ...(def.args?.(c) ?? [])],
 					env: { ...iso.env, PROBE_LOG: join(root, "probe.jsonl"), PROBE_MODE: "" },
 					cwd: iso.projectDir,
 					sessionDirs: [sessionDir, join(iso.agentDir, "subagent-sessions")],
