@@ -157,3 +157,23 @@ test("用户原话额度不够时，最早的一条（任务原始需求）优�
 	assert.ok(t.includes("entryId=u30\n"), "最近的一条被保留");
 	assert.ok(t.indexOf("entryId=u30\n") < t.indexOf("entryId=u1\n"), "渲染按时间倒序");
 });
+
+test("Pt 取下限且锚点为最长中文时：失败不超过组内 60%，余额不为负，验证记录仍收录，失败保留首行与尾部", () => {
+	const anchor = "错".repeat(120);
+	const d: PackData = {
+		verify: [{ cmd: "npm test", status: "退出码 1" }],
+		failures: Array.from({ length: 3 }, (_, i) => ({ tool: "bash", entryId: `f${i}`, tail: `${"输出\n".repeat(300)}${anchor}`, anchor })),
+		users: [],
+		skills: [],
+		modified: [],
+		read: [],
+	};
+	for (const t of [renderLocal(d, 2000, 6000), renderModelData(d, 2000).text]) {
+		assert.ok(t.includes("`npm test` → 退出码 1"), "验证记录仍收录");
+		const failSection = t.slice(t.indexOf("## 最近失败"), t.indexOf("## 用户原话"));
+		assert.ok(failSection.includes("[e1]"), "最近的失败被收录");
+		assert.ok(failSection.includes(`${ESCAPE}错`), "失败保留原文尾部");
+	}
+	const m = renderModelData(d, 2000);
+	assert.ok(m.expected.some((e) => e.id === "v1"));
+});

@@ -32,6 +32,8 @@ const SKILL_BLOCK_RE = /<skill name="([^"]*)" location="([^"]*)">[\s\S]*?<\/skil
 
 const FAIL_KEEP = 3;
 const FAIL_TAIL_CHARS = 1200;
+/** 截断后的失败条目至少保留的原文尾部，单位 estC。 */
+const FAIL_MIN_TAIL_EST = 20;
 const ANCHOR_CHARS = 120;
 const USER_MAX_EST = 1500;
 const USER_HEAD_EST = 1000;
@@ -272,17 +274,22 @@ function selectByEst(all: readonly Item[], data: PackData, Pt: number): Item[] {
 	for (const g of groups) {
 		let room = Math.min(left, Math.floor(g.share * Math.max(0, Pt - fixed)) + carry);
 		const spentBefore = room;
+		// 失败条目的额度：最多占组内 60%，按条数平分；每条至少要放下首行与一小段尾部，放不下时减少条数（保留最近的）。
 		const failures = all.filter((it) => it.section === 1);
-		const failEach = failures.length ? Math.floor((0.6 * room) / failures.length) : 0;
+		const failRoom = Math.floor(0.6 * room);
+		const minCost = (it: Item) => estC(it.text.split("\n", 1)[0]) + FAIL_MIN_TAIL_EST + 2;
+		let failCount = failures.length;
+		while (failCount > 0 && Math.floor(failRoom / failCount) < Math.max(...failures.slice(0, failCount).map(minCost))) failCount--;
+		const failEach = failCount ? Math.floor(failRoom / failCount) : 0;
+		const failKeep = new Set(failures.slice(0, failCount));
 		for (const sec of g.sections) {
 			for (const it of priorityOrder(all, sec)) {
 				const cost = estC(it.text) + 1;
 				if (sec === 1) {
+					if (!failKeep.has(it)) continue;
 					const text = cost <= failEach ? it.text : keepHeadLineAndTail(it.text, failEach - 2);
-					if (failEach > 40) {
-						chosen.push({ ...it, text });
-						room -= estC(text) + 1;
-					}
+					chosen.push({ ...it, text });
+					room -= estC(text) + 1;
 				} else if (cost <= room) {
 					chosen.push(it);
 					room -= cost;
