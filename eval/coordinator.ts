@@ -5,7 +5,7 @@
 //   2. 每个步骤：按最坏情况写预留记录并 fsync，之后才启动 pi 子进程；子进程加载 budget-guard.ts，在进程内执行同一份上限。
 //   3. 子进程结束或超时被终止后，从它的会话文件汇总实际用量并结算；用量缺失时结算为 null，账本按最坏值计。
 //   4. 收到 SIGINT 或 SIGTERM 时不再启动新步骤，终止当前子进程（最多等 10 秒，之后强制结束），释放锁后退出。
-// 账本文件与锁文件都在 ~/.pi/agent/.collab/smart-compact/ 下，路径由 os.homedir() 拼接。
+// 账本文件与锁文件都在 ~/.pi/agent/.collab/smart-compact/budget/ 下（目录权限 0700），路径由 os.homedir() 拼接。
 //
 // 命令行：
 //   node eval/coordinator.ts init-limits <limits.json>   写入用户确认的上限（账本为空时才允许）
@@ -30,8 +30,8 @@ export interface CoordinatorPaths {
 }
 
 export const DEFAULT_PATHS: CoordinatorPaths = {
-	ledgerFile: join(COLLAB_DIR, "budget-ledger.jsonl"),
-	lockFile: join(COLLAB_DIR, "budget.lock"),
+	ledgerFile: join(COLLAB_DIR, "budget", "budget-ledger.jsonl"),
+	lockFile: join(COLLAB_DIR, "budget", "budget.lock"),
 };
 
 /** 预算守卫扩展的绝对路径，子进程用 -e 加载。 */
