@@ -11,8 +11,10 @@ const RULES: { re: RegExp; keepGroup?: number }[] = [
 	{ re: /\bghp_[A-Za-z0-9]{20,}/g },
 	{ re: /\bAKIA[0-9A-Z]{16}\b/g },
 	{ re: /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, keepGroup: 1 },
-	// 键值类只认同时含字母与数字、至少 6 个字符的值，避免把「token: 8192」这类普通文字当成密钥，导致摘要被反复判为不合格。
-	{ re: /(\b(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)["']?\s*[:=]\s*["']?)(?=[^\s"',;]*\d)(?=[^\s"',;]*[A-Za-z])[^\s"',;]{6,}/gi, keepGroup: 1 },
+	// password、secret、api_key 等键后面的任何赋值都视为秘密，只排除已脱敏的占位文本。
+	{ re: /(\b(?:password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|access[_-]?key|private[_-]?key)["']?\s*[:=]\s*["']?)(?!\[已脱敏\])[^\s"',;]{1,}/gi, keepGroup: 1 },
+	// token 一词常用于计量（「token: 8192」），只认像凭据的值：至少 16 个字符，或至少 6 个字符且同时含字母与数字，否则摘要会被反复判为不合格。
+	{ re: /(\b(?:token|auth[_-]?token|access[_-]?token|refresh[_-]?token)["']?\s*[:=]\s*["']?)(?!\[已脱敏\])(?:[^\s"',;]{16,}|(?=[^\s"',;]*\d)(?=[^\s"',;]*[A-Za-z])[^\s"',;]{6,})/gi, keepGroup: 1 },
 ];
 
 /** 替换文本中的全部密钥。 */

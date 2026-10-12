@@ -38,14 +38,15 @@ test("budgetLevel 逐级收紧，overflow 重试时再减半", () => {
 	assert.deepEqual([ov.Pt, ov.K], [4500, 10000]);
 });
 
-const sample = (o: Partial<BaselineSample>): BaselineSample => ({ baselineUsable: true, baselineAdjusted: 50000, calibrationEligible: true, usageInputActual: 50000, bEst: 40000, estWithoutF: 20000, ...o });
+const sample = (o: Partial<BaselineSample>): BaselineSample => ({ baselineUsable: true, baselineAdjusted: 50000, calibrationEligible: true, usageInputActual: 50000, bEst: 40000, estRawWithoutF: 20000, ...o });
 
 test("校准系数限制在 1 到 3，F_est 按真实基线更新", () => {
 	assert.equal(applyBaseline(freshModelState(), sample({ usageInputActual: 400000 }), 1e9).state.c, 3);
 	assert.equal(applyBaseline(freshModelState(), sample({ usageInputActual: 1000 }), 1e9).state.c, 1);
 	const s = applyBaseline(freshModelState(), sample({}), 1e9).state;
 	assert.equal(s.c, 1.25);
-	assert.equal(s.fEst, 30000);
+	// 先校准 c，再按新的 c 估算非固定部分：20000 × 1.25 = 25000，F_est = 50000 − 25000。
+	assert.equal(s.fEst, 25000);
 	// 不可校准时 c 与 F_est 都不变。
 	assert.deepEqual(applyBaseline(freshModelState(), sample({ calibrationEligible: false }), 1e9).state, freshModelState());
 });

@@ -338,32 +338,37 @@ export interface Expected {
 
 /** 按 Pt 选取后生成模型输出模式的压缩包数据。 */
 export function renderModelData(data: PackData, Pt: number): ModelPackData {
-	const list = selectByEst(items(data, LOCAL_MAX_MODIFIED, LOCAL_MAX_READ), data, Pt);
+	const selected = selectByEst(items(data, LOCAL_MAX_MODIFIED, LOCAL_MAX_READ), data, Pt);
 	const expected: Expected[] = [];
-	const keepPresent = (e: Expected, it: Item): Expected => ({ ...e, mustContain: e.mustContain.filter((s) => it.text.includes(s)) });
-	for (const it of list) {
-		if (!it.id) continue;
-		const n = Number(it.id.slice(1)) - 1;
-		switch (it.id[0]) {
-			case "v":
-				expected.push(keepPresent({ id: it.id, section: 0, mustContain: [data.verify[n].cmd, data.verify[n].status] }, it));
-				break;
-			case "e":
-				expected.push(keepPresent({ id: it.id, section: 1, mustContain: [data.failures[n].tool, neutralize(data.failures[n].anchor)].filter(Boolean) }, it));
-				break;
-			case "u":
-				expected.push(keepPresent({ id: it.id, section: 2, mustContain: [`entryId=${data.users[n].entryId}`], needsBody: true }, it));
-				break;
-			case "s":
-				expected.push(keepPresent({ id: it.id, section: 3, mustContain: [data.skills[n].path] }, it));
-				break;
-			case "f":
-				expected.push(keepPresent({ id: it.id, section: 4, mustContain: [data.modified[n]] }, it));
-				break;
-		}
+	const list: Item[] = [];
+	for (const it of selected) {
+		const e = it.id ? expectationFor(data, it.id) : null;
+		// 条目被裁剪后不再完整包含逐字凭据（命令、状态、锚点、路径、entryId）时整条舍弃，不能靠放宽校验接受它。
+		if (e && !e.mustContain.every((s) => it.text.split("\n").some((l) => structural(l) && l.includes(s)))) continue;
+		list.push(it);
+		if (e) expected.push(e);
 	}
 	expected.push({ id: "h1", section: 5, mustContain: [data.handoffPath, "recall_history"].filter((x): x is string => !!x) });
 	return { text: render(list, data), expected };
+}
+
+/** 一个编号条目在模型输出中必须逐字保留的内容。 */
+function expectationFor(data: PackData, id: string): Expected | null {
+	const n = Number(id.slice(1)) - 1;
+	switch (id[0]) {
+		case "v":
+			return { id, section: 0, mustContain: [data.verify[n].cmd, data.verify[n].status] };
+		case "e":
+			return { id, section: 1, mustContain: [data.failures[n].tool, neutralize(data.failures[n].anchor)].filter(Boolean) };
+		case "u":
+			return { id, section: 2, mustContain: [`entryId=${data.users[n].entryId}`], needsBody: true };
+		case "s":
+			return { id, section: 3, mustContain: [data.skills[n].path] };
+		case "f":
+			return { id, section: 4, mustContain: [data.modified[n]] };
+		default:
+			return null;
+	}
 }
 
 /** 模型输出中压缩包开始标记之前的部分，即叙述摘要。没有标记时返回全文。 */

@@ -119,3 +119,21 @@ test("模型输出模式的受控回退要求 [h1] 行包含交接路径与 reca
 	const r = await summarize(options);
 	assert.ok(r.ok && r.fallback);
 });
+
+test("重试说明计入输入上限：放不下时不发送重试，转入受控回退", async () => {
+	const W = 30000;
+	const limitFor = (focus: string | undefined) => W - 4096 - 4096 - 1500 - utf8Bytes(focus ?? "") - 1000;
+	// 先探测主路径最终调用的侧重点，再把正文调到恰好填满该调用的输入上限，任何重试说明都会让它超限。
+	const dry = opts(() => ok(GOOD), { windowTokens: W, N: 4096, items: ["x"] });
+	await summarize(dry.options);
+	const fill = limitFor(dry.calls[0].focus) - 8;
+	const { options, calls } = opts((_a, n) => (n === 1 ? ok(MISSING) : ok("回退")), { windowTokens: W, N: 4096, items: ["a".repeat(fill)] });
+	const r = await summarize(options);
+	assert.ok(r.ok && r.fallback, JSON.stringify(r));
+	assert.equal(calls.length, 2, "不合格之后不应再发送带重试说明的主路径请求");
+	assert.ok(!calls[1].focus?.includes("上次输出不合格"));
+	for (const c of calls) {
+		const input = c.items.reduce((x, t) => x + utf8Bytes(t) + 8, 0);
+		assert.ok(input <= limitFor(c.focus));
+	}
+});

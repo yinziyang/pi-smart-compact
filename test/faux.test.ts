@@ -142,6 +142,9 @@ test("R3：自动压缩次数达上限后进入 R5，之后的普通输入被拦
 	const state = r.entries.filter((e) => e.type === "custom" && e.customType === "smart-compact").at(-1);
 	assert.equal((state?.data as { r5?: { reason: string } }).r5?.reason, "count");
 	assert.ok(!userTexts(r.entries).some((t) => t.includes("第二个问题")));
+	// 进入 R5 时立即中止当前运行：压缩之后不再有发给主模型的请求。
+	const sumAt = r.requests.findIndex((q) => q.summary);
+	assert.equal(r.requests.slice(sumAt + 1).filter((q) => !q.summary).length, 0);
 });
 
 test("历史被修改：发现失效的那次请求前立即重建，模型看到的是新摘要，重建结果以 compaction 落盘，被删除的内容不进入新摘要", async () => {
@@ -166,6 +169,8 @@ test("历史被修改：发现失效的那次请求前立即重建，模型看�
 	assert.ok(!sums.at(-1)!.text.includes("SECRETWORD9"), "重建请求不应包含被删除的内容");
 	const state = r.entries.filter((e) => e.type === "custom" && e.customType === "smart-compact").at(-1);
 	assert.equal((state?.data as { r5?: unknown }).r5 ?? null, null);
+	const recs = (state?.data as { records: Record<string, { reason: string }[]> }).records["faux/m"];
+	assert.equal(recs.at(-1)?.reason, "rebuild");
 	// 重建之后发给主模型的请求都不含被删除的内容，也不含旧摘要。
 	const rebuildAt = r.requests.lastIndexOf(sums.at(-1)!);
 	const after = r.requests.slice(rebuildAt + 1).filter((q) => !q.summary);

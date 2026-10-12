@@ -178,6 +178,8 @@ interface CallSpec<T> {
 	focus: string | undefined;
 	previousSummary: string | undefined;
 	validate: (text: string) => string[];
+	/** 带上本次侧重点（含重试说明）后，完整请求是否仍在输入上限之内（方案 5.2 第 5 步）。 */
+	fits: (focus: string | undefined) => boolean;
 }
 
 /** 执行一次调用并校验；不合格时带着问题说明重试一次。成功返回文本，失败返回原因。 */
@@ -187,10 +189,12 @@ async function callValidated<T>(o: SummarizeOptions<T>, stats: SummaryStats, spe
 		const left = o.maxRequests - stats.requests;
 		if (left <= 0) return { error: `单次压缩的 provider 请求达到上限 ${o.maxRequests}` };
 		if (o.now() >= o.deadline) return { error: "单次压缩超过墙钟时间上限" };
+		const focus = joinFocus([spec.focus, extra]);
+		if (!spec.fits(focus)) return { error: "加上重试说明后输入超过上限" };
 		const r = await o.generate({
 			items: spec.items,
 			reserveTokens: reserveFor(spec.nOut),
-			focus: joinFocus([spec.focus, extra]),
+			focus,
 			previousSummary: spec.previousSummary,
 			thinkingLevel: "off",
 			maxRequests: left,
@@ -244,7 +248,8 @@ async function mainPath<T>(o: SummarizeOptions<T>, stats: SummaryStats): Promise
 				const missing = checkStructure(narrative).map((h) => `缺少章节或内容过短：${h}`);
 				return o.mode === "model" ? [...missing, ...validateModelPack(text, o.expected ?? [])] : missing;
 			};
-			const r = await callValidated(o, stats, { items: rest, nOut: finalNOut, focus: finalFocus, previousSummary: prev, validate });
+			const fits = (f: string | undefined) => total <= inputLimit(o, finalNOut, f, prev);
+			const r = await callValidated(o, stats, { items: rest, nOut: finalNOut, focus: finalFocus, previousSummary: prev, validate, fits });
 			if ("error" in r) return r;
 			return { text: r.text, narrative: o.mode === "model" ? narrativePart(r.text).trimEnd() : r.text };
 		}
@@ -263,7 +268,9 @@ async function mainPath<T>(o: SummarizeOptions<T>, stats: SummaryStats): Promise
 				break;
 			} else break;
 		}
-		const r = await callValidated(o, stats, { items: batch, nOut: o.N, focus: midFocus, previousSummary: prev, validate: (t) => checkStructure(t).map((h) => `缺少章节或内容过短：${h}`) });
+		const batchSize = batch.reduce((a, t) => a + sizeOf(o, t), 0);
+		const fits = (f: string | undefined) => batchSize <= inputLimit(o, o.N, f, prev);
+		const r = await callValidated(o, stats, { items: batch, nOut: o.N, focus: midFocus, previousSummary: prev, validate: (t) => checkStructure(t).map((h) => `缺少章节或内容过短：${h}`), fits });
 		if ("error" in r) return r;
 		prev = r.text;
 	}
@@ -303,7 +310,9 @@ async function fallbackPath<T>(o: SummarizeOptions<T>, stats: SummaryStats): Pro
 		const need = ["recall_history", ...(o.handoffPath ? [o.handoffPath] : [])];
 		return need.filter((s) => !line.includes(s)).map((s) => `[h1] 缺少：${s}`);
 	};
-	return callValidated(o, stats, { items, nOut: o.N, focus, previousSummary: o.previousSummary, validate });
+	const size = items.reduce((a, t) => a + sizeOf(o, t), 0);
+	const fits = (f: string | undefined) => size <= inputLimit(o, o.N, f, o.previousSummary);
+	return callValidated(o, stats, { items, nOut: o.N, focus, previousSummary: o.previousSummary, validate, fits });
 }
 
 /** 生成最终摘要：先走主路径，失败后走一次受控回退。 */

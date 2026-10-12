@@ -120,3 +120,12 @@ test("模型输出模式：原样回填的压缩包合格，各类篡改都判�
 	const emptyUser = out.replace(/(- \[u1\] entryId=u-last)\n(│ .*\n)+/, "$1\n");
 	assert.notDeepEqual(validateModelPack(emptyUser, expected), [], "用户原话为空");
 });
+
+test("模型输出模式：被裁剪得不再包含完整凭据的条目整条舍弃，不能用伪造内容通过校验", () => {
+	const d: PackData = { verify: [{ cmd: `npm test ${"x".repeat(10000)}`, status: "退出码 1" }], failures: [], users: [], skills: [], modified: [], read: [], handoffPath: "/tmp/h.md" };
+	const { text, expected } = renderModelData(d, 2000);
+	assert.ok(!expected.some((e) => e.id === "v1"));
+	assert.ok(!text.includes("[v1]"));
+	const forged = `## Goal\nx\n${text.replace("## 最近失败", "- [v1] 任意假命令 → 退出码 0\n## 最近失败")}`;
+	assert.notDeepEqual(validateModelPack(forged, expected), []);
+});

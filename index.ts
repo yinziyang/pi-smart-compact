@@ -7,7 +7,7 @@
 //   - 处于 R5 时，普通输入被拦截，每个回合开始时中止，只有 /compact 与 /smart-compact 可用（方案 7.4 R5）。
 //   - context handler 不抛异常：出错时把消息中的压缩摘要替换为固定短通知。
 
-import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -15,13 +15,14 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { VERSION, type ExtensionAPI, type ExtensionContext, type SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { applyBaseline, applyDensity, computeBudget, countAutoCompactions, freshModelState, isOwnCompaction, type ModelState } from "./budget.ts";
-import { chooseModel, handoffDoc, initialFEst, isVirtual, modelKey, requestFromEvent, runCompaction, type OwnDetails } from "./compact.ts";
+import { handoffDir, handoffDoc, nextHandoffPath, removeHandoffsBefore, writeHandoffFile } from "./handoff.ts";
+import { chooseModel, initialFEst, isVirtual, modelKey, requestFromEvent, runCompaction, virtualWindow, type OwnDetails } from "./compact.ts";
 import { applyEdits, contentText, findInvalidation, messageText, toolCalls, type RawEntry } from "./edits.ts";
 import { extractPack, type RecoveryRecord } from "./pack.ts";
 import { recallById, recallByQuery, validRecoveryRecords, type RecallDoc } from "./recall.ts";
 import * as rec from "./recovery.ts";
 import { redact } from "./redact.ts";
-import { MAX_RECORDS, parseConfig, restoreState, STATE_TYPE, freshState, type CompactionRecord, type Config, type PersistedState, type R5Reason } from "./state.ts";
+import { compactionSettingsFor, MAX_RECORDS, parseConfig, restoreState, STATE_TYPE, freshState, type CompactionRecord, type Config, type PersistedState, type R5Reason } from "./state.ts";
 
 /** 已验证的 pi 版本；不一致时不接管摘要（方案风险 2）。 */
 export const VERIFIED_PI_VERSION = "1.1.0";
@@ -60,7 +61,7 @@ interface PendingSample {
 	key: string;
 	T: number;
 	bEst: number;
-	estWithoutF: number;
+	estRawWithoutF: number;
 }
 
 interface Runtime {
@@ -162,44 +163,48 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		ctx.ui.setStatus(STATUS_KEY, r.state.r5 ? `自动压缩已停止：${R5_TEXT[r.state.r5.reason]}` : undefined);
 	};
 
-	/** 交接文档目录；没有 session 文件时返回 undefined（方案 11.5）。 */
-	const handoffDir = (ctx: ExtensionContext): string | undefined => {
-		if (!ctx.sessionManager.getSessionFile()) return undefined;
-		return join(ctx.sessionManager.getSessionDir(), "smart-compact", ctx.sessionManager.getSessionId());
+	const dirOf = (ctx: ExtensionContext) => handoffDir(ctx.sessionManager.getSessionFile(), ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+	const nextPath = (ctx: ExtensionContext): string | undefined => {
+		const dir = dirOf(ctx);
+		return dir ? nextHandoffPath(dir, deps.now()) : undefined;
 	};
-	const nextHandoffPath = (ctx: ExtensionContext): string | undefined => {
-		const dir = handoffDir(ctx);
-		if (!dir) return undefined;
-		let n = 0;
-		try {
-			n = readdirSync(dir).filter((f) => f.endsWith(".md")).length;
-		} catch {
-			n = 0;
-		}
-		return join(dir, `${String(n + 1).padStart(4, "0")}-${new Date(deps.now()).toISOString().replace(/[:.]/g, "-")}.md`);
-	};
-	/** 写交接文档并清理超过保留份数的旧文件；失败只记警告（方案第 9 节）。返回是否写成功。 */
+	/** 写交接文档；失败只记警告（方案第 9 节）。返回是否写成功。 */
 	const writeHandoff = (ctx: ExtensionContext, r: Runtime, path: string | undefined, text: string): boolean => {
-		if (!path) return false;
+		const dir = dirOf(ctx);
+		if (!path || !dir) return false;
 		try {
-			const dir = handoffDir(ctx)!;
-			mkdirSync(dir, { recursive: true, mode: 0o700 });
-			writeFileSync(path, text, { mode: 0o600 });
-			const files = readdirSync(dir).filter((f) => f.endsWith(".md")).sort();
-			for (const f of files.slice(0, Math.max(0, files.length - config.handoffKeep))) unlinkSync(join(dir, f));
+			writeHandoffFile(dir, path, text, config.handoffKeep);
 			return true;
 		} catch (err) {
 			notifyOnce(ctx, r, `handoff:${path}`, `smart-compact：交接文档写入失败：${err instanceof Error ? err.message : String(err)}`);
 			return false;
 		}
 	};
+	/** 重建成功后删除本会话中生成时间早于失效编辑的交接文档；清理失败不影响压缩结果。 */
+	const cleanupHandoffs = (ctx: ExtensionContext, r: Runtime, keep: string | undefined) => {
+		const dir = dirOf(ctx);
+		if (dir && r.invalidatedAt !== null) {
+			try {
+				removeHandoffsBefore(dir, keep, r.invalidatedAt);
+			} catch {
+				// 旧文档留在本会话目录中，不影响压缩结果。
+			}
+		}
+		r.invalidatedAt = null;
+	};
 
-	const enterR5 = (ctx: ExtensionContext, r: Runtime, reason: R5Reason) => {
+	/**
+	 * 进入 R5。abort 为真（缺省）时立即中止当前运行，并在下一个 turn_start 再中止一次：进入 R5 的位置可能晚于本回合的 turn_start（例如虚拟模型在 prepareRequest 中触发的压缩、context 事件），只等下一个回合会让本回合的请求与工具照常执行。
+	 * session_before_compact 返回压缩结果的路径传 false，避免中止影响 pi 追加这次结果，由下一个 turn_start 中止。
+	 */
+	const enterR5 = (ctx: ExtensionContext, r: Runtime, reason: R5Reason, abort = true) => {
+		r.abortNextTurn = true;
+		if (abort) ctx.abort();
 		if (r.state.r5?.reason === reason) return;
 		r.state.r5 = { reason, since: new Date(deps.now()).toISOString() };
 		r.dirty = true;
 		// 进入时写一份交接文档，包含被 pi 移出上下文的最近执行记录（方案 7.4 R5 行为）。
-		const path = nextHandoffPath(ctx);
+		const path = nextPath(ctx);
 		const pending = [...r.scan.collected, ...r.scan.batches.flatMap((b) => b.records)];
 		const data = extractPack({ entries: applyEdits(branchOf(ctx)), keptIds: new Set(), omitted: pending, handoffPath: path });
 		const ok = writeHandoff(ctx, r, path, handoffDoc(`smart-compact 交接文档（自动压缩已停止：${R5_TEXT[reason]}）`, undefined, data, { reason }));
@@ -242,15 +247,18 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 	const precheck = (ctx: ExtensionContext, r: Runtime) => {
 		const model = ctx.model;
 		if (!model) return;
-		const reserve = pi.getSettings().compaction?.reserveTokens ?? 16384;
+		const reserve = compactionSettingsFor(pi.getSettings(), modelKey(model)).reserveTokens;
 		let window = model.contextWindow;
+		r.declaredWindow = null;
 		if (isVirtual(model)) {
-			const choice = chooseModel(ctx, branchOf(ctx), config);
-			if (!choice) {
-				notifyOnce(ctx, r, `virtual-empty:${modelKey(model)}`, `smart-compact：虚拟模型 ${modelKey(model)} 没有可用的物理模型，压缩时将停止自动压缩。`);
+			// 虚拟模型的窗口在这里就确定并保存，message_end 从第一条响应起校验实际路由（方案 7.2）。
+			const vw = virtualWindow(ctx, model, config);
+			if (!vw) {
+				if (r.state.r5?.reason !== "virtual") enterR5(ctx, r, "virtual");
 				return;
 			}
-			window = choice.window;
+			if (vw.declared) r.declaredWindow = vw.window;
+			window = vw.window;
 			if (!config.virtualWindowTokens[modelKey(model)] && !(model.contextWindow > 0)) notifyOnce(ctx, r, `virtual-floor:${modelKey(model)}`, `smart-compact：虚拟模型 ${modelKey(model)} 的预算窗口取注册表最小值 ${window}，可在 smart-compact.json 的 virtualWindowTokens 中声明。`, "info");
 		}
 		const T = window - reserve;
@@ -271,12 +279,18 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		precheck(ctx, r);
 	});
 	pi.on("session_tree", (_e, ctx) => {
-		restore(ctx);
+		precheck(ctx, restore(ctx));
+	});
+	// 注册表刷新或鉴权变化后重新计算虚拟模型窗口（方案 7.2）。
+	pi.on("before_agent_start", (_e, ctx) => {
+		precheck(ctx, rt(ctx));
 	});
 
 	pi.on("model_select", (e, ctx) => {
 		const r = rt(ctx);
 		const changed = !e.previousModel || modelKey(e.model) !== modelKey(e.previousModel);
+		// 切换模型后，新模型的响应不能作为旧模型压缩后的基线样本（方案 7.1 按物理模型分开保存）。
+		if (changed) r.pendingSample = null;
 		if (changed && r.state.r5 && (r.state.r5.reason === "baseline" || r.state.r5.reason === "failed" || r.state.r5.reason === "virtual")) exitR5(ctx, r);
 		precheck(ctx, r);
 	});
@@ -323,14 +337,13 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 			return "failed";
 		}
 		const latest = [...branch].reverse().find((x) => x.type === "compaction");
-		const cs = pi.getSettings().compaction;
 		const ms = modelStateFor(r, choice.key);
-		const handoffPath = nextHandoffPath(ctx);
+		const handoffPath = nextPath(ctx);
 		const out = await runCompaction({
 			event: {
 				reason: "manual",
 				willRetry: false,
-				settings: { reserveTokens: cs?.reserveTokens ?? 16384, keepRecentTokens: cs?.keepRecentTokens ?? 20000 },
+				settings: compactionSettingsFor(pi.getSettings(), modelKey(ctx.model ?? choice.summaryModel)),
 				tokensBefore: ctx.getContextUsage()?.tokens ?? 0,
 				branchEntries: branch,
 				fallbackFirstKept: latest?.firstKeptEntryId ?? "",
@@ -356,7 +369,13 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		}
 		if (!writeHandoff(ctx, r, handoffPath, out.handoff)) out.result.details.handoffPath = undefined;
 		if (r.state.r5?.reason === "history") exitR5(ctx, r);
-		removeHandoffsBefore(ctx, r, out.result.details.handoffPath);
+		cleanupHandoffs(ctx, r, out.result.details.handoffPath);
+		// 边界条目追加的 compaction 不触发 session_compact（agent-session.js 的 _commitBoundaryDrafts），统计在这里记录。
+		// 简化：重建之后不做基线采样，旧样本作废；它不计入自动压缩次数，也不参与 R1、R2，下一次正常压缩照常采样。
+		r.pendingSample = null;
+		const record: CompactionRecord = { time: new Date(deps.now()).toISOString(), reason: "rebuild", tokensBefore: ctx.getContextUsage()?.tokens ?? null, bEst: out.result.details.bEst, usageInputActual: null, addedEstimate: null, baselineAdjusted: null, baselineUsable: false, calibrationEligible: false };
+		r.state.records[choice.key] = [...(r.state.records[choice.key] ?? []), record].slice(-MAX_RECORDS);
+		r.dirty = true;
 		const { summary, firstKeptEntryId, details, usage } = out.result;
 		return { type: "compaction", summary, firstKeptEntryId, details, usage };
 	};
@@ -425,6 +444,11 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		}
 		const s = r.pendingSample;
 		if (!s) return;
+		// 只采样与压缩时同一个物理模型的响应；虚拟路由到其他模型时放弃本次样本。
+		if (m.provider && m.model && `${m.provider}/${m.model}` !== s.key && m.stopReason !== "error" && m.stopReason !== "aborted") {
+			r.pendingSample = null;
+			return;
+		}
 		const u = m.usage ?? {};
 		const nums = ["input", "output", "cacheRead", "cacheWrite"].map((k) => u[k]);
 		if (m.stopReason === "error" || m.stopReason === "aborted" || !nums.every((x) => typeof x === "number" && Number.isFinite(x) && x >= 0)) return;
@@ -447,7 +471,7 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 			last.baselineUsable = usable;
 			last.calibrationEligible = usable;
 		}
-		const out = applyBaseline(modelStateFor(r, s.key), { baselineUsable: usable, baselineAdjusted: usable ? actual : null, calibrationEligible: usable, usageInputActual: actual, bEst: s.bEst, estWithoutF: s.estWithoutF }, s.T);
+		const out = applyBaseline(modelStateFor(r, s.key), { baselineUsable: usable, baselineAdjusted: usable ? actual : null, calibrationEligible: usable, usageInputActual: actual, bEst: s.bEst, estRawWithoutF: s.estRawWithoutF }, s.T);
 		setModelState(r, s.key, out.state);
 		if (out.r5 && !r.state.r5) {
 			enterR5(ctx, r, out.r5);
@@ -564,10 +588,10 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 			setModelState(r, choice.key, ms);
 			if (dens.r5 && !r.state.r5) {
 				if (event.reason === "threshold") return stop("baseline");
-				enterR5(ctx, r, "baseline");
+				enterR5(ctx, r, "baseline", false);
 			}
 			const fEst = ms.fEst ?? initialFEst(ctx.getSystemPrompt(), activeTools());
-			const handoffPath = nextHandoffPath(ctx);
+			const handoffPath = nextPath(ctx);
 			// overflow 且会重试时，在调用模型之前先把被省略的执行记录写进交接文档（方案第 8 节）。
 			if (event.reason === "overflow" && event.willRetry && batch) {
 				const data = extractPack({ entries: applyEdits(branch), keptIds: new Set(), omitted: batch.records, handoffPath });
@@ -589,7 +613,7 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 				return { cancel: true };
 			}
 			// overflow 与 manual 在下限参数仍不满足不变量时照常压缩，但随后进入 R5（方案 7.3、7.4）。
-			if (!out.result.details.budget.ok && auto) enterR5(ctx, r, "baseline");
+			if (!out.result.details.budget.ok && auto) enterR5(ctx, r, "baseline", false);
 			const wrote = writeHandoff(ctx, r, handoffPath, out.handoff);
 			if (!wrote) out.result.details.handoffPath = undefined;
 			r.returned = { nonce, batchNonce, key: choice.key, T, reason: event.reason, tokensBefore: event.preparation.tokensBefore };
@@ -611,17 +635,21 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		const mine = r.returned;
 		r.returned = null;
 		if (mine && details?.nonce === mine.nonce) {
-			if (mine.batchNonce) rec.consumeBatch(r.scan, mine.batchNonce);
+			// 恢复批次单独核对自己的 nonce：其他 handler 可能保留顶层 nonce 却改掉 omittedAttempt。
+			if (mine.batchNonce) {
+				if (details.omittedAttempt?.nonce === mine.batchNonce) rec.consumeBatch(r.scan, mine.batchNonce);
+				else writeRecovery(r, mine.batchNonce);
+			}
 			const record: CompactionRecord = { time: new Date(deps.now()).toISOString(), reason: mine.reason, tokensBefore: mine.tokensBefore, bEst: details.bEst ?? null, usageInputActual: null, addedEstimate: null, baselineAdjusted: null, baselineUsable: false, calibrationEligible: false };
 			r.state.records[mine.key] = [...(r.state.records[mine.key] ?? []), record].slice(-MAX_RECORDS);
 			r.dirty = true;
 			if (details.rebuild && r.state.r5?.reason === "history") {
 				exitR5(ctx, r);
-				removeHandoffsBefore(ctx, r, details.handoffPath);
+				cleanupHandoffs(ctx, r, details.handoffPath);
 			}
 			if (countAutoCompactions(branchOf(ctx)) >= config.maxAutoCompactions && !r.state.r5) enterR5(ctx, r, "count");
 			persist(r);
-			r.pendingSample = { leafId: ctx.sessionManager.getLeafId(), key: mine.key, T: mine.T, bEst: details.bEst ?? 0, estWithoutF: details.estWithoutF ?? 0 };
+			r.pendingSample = { leafId: ctx.sessionManager.getLeafId(), key: mine.key, T: mine.T, bEst: details.bEst ?? 0, estRawWithoutF: details.estRawWithoutF ?? 0 };
 			return;
 		}
 		if (mine) {
@@ -641,21 +669,6 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		flushCustom(r);
 		persist(r);
 	});
-
-	/** 重建成功后删除本会话中生成时间早于失效编辑的交接文档（方案 5.2 第 4 步）。 */
-	const removeHandoffsBefore = (ctx: ExtensionContext, r: Runtime, keep: string | undefined) => {
-		const dir = handoffDir(ctx);
-		if (!dir || r.invalidatedAt === null) return;
-		try {
-			for (const f of readdirSync(dir)) {
-				const p = join(dir, f);
-				if (p !== keep && f.endsWith(".md") && statSync(p).mtimeMs < r.invalidatedAt) unlinkSync(p);
-			}
-		} catch {
-			// 清理失败不影响压缩结果，旧文档留在本会话目录中。
-		}
-		r.invalidatedAt = null;
-	};
 
 	/** recall_history 的检索范围：应用了编辑的原始分支中的消息，加上通过验证的恢复省略记录（方案第 6 节）。 */
 	const recallDocs = (ctx: ExtensionContext): RecallDoc[] => {

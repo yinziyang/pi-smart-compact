@@ -10,7 +10,8 @@ import { computeBudget, estC, utf8Bytes, type Budget, type ModelState, type Pack
 import { chooseCut, type CutEntry } from "./cut.ts";
 import { applyEdits, type RawEntry } from "./edits.ts";
 import { summarize, type Generate, type SummaryStats } from "./narrative.ts";
-import { extractPack, renderFull, renderLocal, renderModelData, truncateBytes, type PackData, type RecoveryRecord } from "./pack.ts";
+import { handoffDoc } from "./handoff.ts";
+import { extractPack, renderFull, renderLocal, renderModelData, truncateBytes, type RecoveryRecord } from "./pack.ts";
 import { redact, redactDeep } from "./redact.ts";
 import type { Config } from "./state.ts";
 
@@ -39,7 +40,8 @@ export interface OwnDetails {
 	omittedAttempt?: { version: 1; nonce: string; createdAt: string; records: RecoveryRecord[] };
 	handoffPath?: string;
 	bEst: number;
-	estWithoutF: number;
+	/** 叙述、压缩包与保留区按 c = 1 的估算之和。 */
+	estRawWithoutF: number;
 	modelKey: string;
 }
 
@@ -188,12 +190,6 @@ function sumUsage(stats: SummaryStats): Usage {
 	return { input: stats.input, output: stats.output, cacheRead: stats.cacheRead, cacheWrite: stats.cacheWrite, totalTokens: total, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: stats.cost ?? 0 } };
 }
 
-/** 交接文档正文（方案 11.5）。在写盘前统一脱敏。 */
-export function handoffDoc(title: string, narrative: string | undefined, data: PackData, extra: Record<string, unknown>): string {
-	const parts = [`# ${title}`, "", "## 叙述摘要", "", narrative ?? "（无）", "", "## 压缩包（未裁剪）", "", renderFull(data), "", "## 完整文件清单", "", "### 已修改", ...data.modified.map((p) => `- ${p}`), "", "### 已读取", ...data.read.map((p) => `- ${p}`), "", "## 本次统计", "", "```json", JSON.stringify(extra, null, 2), "```", ""];
-	return redact(parts.join("\n"));
-}
-
 /** 执行一次压缩的主流程。不抛异常：内部错误转成 failed。 */
 export async function runCompaction(input: CompactInput): Promise<CompactOutcome> {
 	const { event, ctx, config, choice, modelState, fEst, omitted, rebuild, handoffPath, nonce, fault, now } = input;
@@ -333,7 +329,7 @@ export async function runCompaction(input: CompactInput): Promise<CompactOutcome
 		omittedAttempt: omitted ? { version: 1, nonce: omitted.nonce, createdAt: new Date(now()).toISOString(), records: omitted.records } : undefined,
 		handoffPath,
 		bEst: fEst + estWithoutF,
-		estWithoutF,
+		estRawWithoutF: estWithoutF / c,
 		modelKey: choice.key,
 	};
 	const handoff = handoffDoc("smart-compact 交接文档", res.narrative, data, { ...statsExtra, stats: details.stats, fallback: res.fallback, mainError: res.ok ? res.mainError : undefined, bEst: details.bEst });

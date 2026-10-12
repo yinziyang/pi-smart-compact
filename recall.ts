@@ -32,8 +32,11 @@ export function validRecoveryRecords(branch: readonly RawEntry[], records: reado
 	});
 }
 
+const TRUNCATED = "\n…[已截断]";
+
+/** 截到总长不超过 max，截断标记计入上限。 */
 function cap(s: string, max: number): string {
-	return s.length <= max ? s : `${s.slice(0, max)}\n…[已截断]`;
+	return s.length <= max ? s : `${s.slice(0, max - TRUNCATED.length)}${TRUNCATED}`;
 }
 
 /** 按 entryId 取全文，最多 MAX_TOTAL 字符。找不到时返回 null。 */

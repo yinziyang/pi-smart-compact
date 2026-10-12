@@ -127,8 +127,8 @@ export interface BaselineSample {
 	usageInputActual: number | null;
 	/** 本次压缩的预估基线 B_est。 */
 	bEst: number;
-	/** estC(叙述 + 压缩包 + 保留区)，用于更新 F_est。 */
-	estWithoutF: number;
+	/** 叙述、压缩包与保留区按 c = 1 的估算之和；更新 F_est 时乘以校准后的新 c，先校准 c 再更新 F_est（方案 7.1）。 */
+	estRawWithoutF: number;
 }
 
 export interface RuleOutcome {
@@ -142,7 +142,7 @@ export function applyBaseline(prev: ModelState, sample: BaselineSample, T: numbe
 	const state = { ...prev };
 	if (sample.calibrationEligible && sample.usageInputActual !== null && sample.bEst > 0) {
 		state.c = Math.min(3, Math.max(1, (sample.usageInputActual / sample.bEst) * state.c));
-		state.fEst = Math.max(0, Math.round(sample.usageInputActual - sample.estWithoutF));
+		state.fEst = Math.max(0, Math.round(sample.usageInputActual - sample.estRawWithoutF * state.c));
 	}
 	if (!sample.baselineUsable || sample.baselineAdjusted === null) return { state };
 	if (sample.baselineAdjusted > BASELINE_RATIO * T) {

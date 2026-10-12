@@ -15,7 +15,10 @@ test("每类密钥各一条正例与一条反例", () => {
 		[`aws ${fake("AKIA", "ABCDEFGHIJKLMNOP")}`, "AKIA123"],
 		[`Authorization: Bearer ${fake("abc", "def123456789")}`, "Bearer 是一种认证方式"],
 		[`${fake("-----BEGIN RSA ", "PRIVATE KEY-----")}\nMIIE\n-----END RSA PRIVATE KEY-----`, "BEGIN PUBLIC KEY"],
-		[`password=${fake("hunter", "2abc")}`, "password: 见文档"],
+		[`password=${fake("hunter", "2abc")}`, "密码在文档里"],
+		["password=alphabeticpass", "passwords are hashed"],
+		["secret=123456789", "secretary"],
+		[`token=${fake("abcdefgh", "ijklmnopqrst")}`, "token: 8192"],
 		[`api_key: "${fake("abc", "123def")}"`, "tokens: 8192"],
 	];
 	for (const [pos, neg] of cases) {
@@ -46,10 +49,10 @@ test("entryId 取全文，总长度不超过上限并注明已截断", () => {
 	assert.equal(recallById(docs, "nope"), null);
 	const big = [{ entryId: "b", role: "user", time: "", text: "z".repeat(50000) }];
 	const r = recallById(big, "b")!;
-	assert.ok(r.length <= MAX_TOTAL + 20);
+	assert.ok(r.length <= MAX_TOTAL);
 	assert.match(r, /已截断/);
 	const many = Array.from({ length: 20 }, (_, i) => ({ entryId: `m${i}`, role: "user", time: "", text: `kw ${"q".repeat(3000)}` }));
-	assert.ok(recallByQuery(many, "kw").length <= MAX_TOTAL + 20);
+	assert.ok(recallByQuery(many, "kw").length <= MAX_TOTAL);
 });
 
 test("恢复记录逐条验证：编辑不在分支上、不是 null 编辑、之后又被编辑的都不可召回", () => {

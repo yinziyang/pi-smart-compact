@@ -145,3 +145,24 @@ export function parseConfig(text: string | undefined): { config: Config; problem
 	}
 	return { config, problems };
 }
+
+/** pi 的内置缺省值（settings-manager.js 的 DEFAULT_COMPACTION_TOKEN_SETTINGS）。 */
+const DEFAULT_RESERVE = 16384;
+const DEFAULT_KEEP_RECENT = 20000;
+
+function tokenSetting(v: unknown): number | undefined {
+	return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : undefined;
+}
+
+/**
+ * 按 pi 的优先级解析某个模型生效的压缩余量：compaction.modelOverrides["provider/id"] → compaction → 内置缺省（settings-manager.js 的 getCompactionTokenSetting）。
+ * pi 遇到非法值会抛错并拒绝压缩；这里遇到非法值退到下一级，只用于预检与重建的预算计算。
+ */
+export function compactionSettingsFor(settings: unknown, key: string): { reserveTokens: number; keepRecentTokens: number } {
+	const c = (settings as { compaction?: Record<string, unknown> } | undefined)?.compaction ?? {};
+	const o = ((c.modelOverrides as Record<string, Record<string, unknown>> | undefined) ?? {})[key] ?? {};
+	return {
+		reserveTokens: tokenSetting(o.reserveTokens) ?? tokenSetting(c.reserveTokens) ?? DEFAULT_RESERVE,
+		keepRecentTokens: tokenSetting(o.keepRecentTokens) ?? tokenSetting(c.keepRecentTokens) ?? DEFAULT_KEEP_RECENT,
+	};
+}
