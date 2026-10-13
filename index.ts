@@ -25,7 +25,7 @@ import { redact, redactDeep } from "./redact.ts";
 import { compactionSettingsFor, MAX_RECORDS, parseConfig, restoreState, STATE_TYPE, freshState, type CompactionRecord, type Config, type PersistedState, type R5Reason } from "./state.ts";
 
 /** 已验证的 pi 版本；不一致时不接管摘要（方案风险 2）。 */
-export const VERIFIED_PI_VERSION = "1.1.0";
+export const VERIFIED_PI_VERSION = "1.2.0";
 const RESET_TYPE = "smart-compact-reset";
 const INVALIDATED_TYPE = "smart-compact-invalidated";
 const STATUS_KEY = "smart-compact";

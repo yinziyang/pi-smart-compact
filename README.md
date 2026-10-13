@@ -116,7 +116,7 @@ pi remove git:https://github.com/yinziyang/pi-smart-compact.git
 
 ## 兼容性与限制
 
-- 已验证的 pi 版本为 1.1.0。pi 版本不同时，扩展自动不接管压缩摘要并提示一次，此时 pi 回到默认压缩。
+- 已验证的 pi 版本为 1.2.0。pi 版本不同时，扩展自动不接管压缩摘要并提示一次，此时 pi 回到默认压缩。
 - 与 pi-goal、pi-subagents 兼容：子会话按各自模型的窗口压缩；pi-goal 的评估者只读取最新一份摘要，并能读到其中的验证记录。
 - 不要同时安装其他会返回 compaction 的扩展，pi 只采用最后一个结果。
 - 限定了工具的子 agent（例如 Explore、Plan）拿不到 `recall_history`，只能依赖压缩摘要。
