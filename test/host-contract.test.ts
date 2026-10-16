@@ -58,6 +58,31 @@ function fixture(logThrows = false) {
 	return { handlers, commands, manager, ctx, event, input, branch, env, logs, counts: () => ({ aborts, appends }), recall: () => tool.execute("id", { query: "旧内容" }, undefined, undefined, ctx) };
 }
 
+test("主请求已取消但压缩信号尚未取消时明确返回cancel，不能回退原生摘要", async () => {
+	const f = fixture();
+	f.env.PI_SMART_COMPACT_FAULT = "all";
+	f.event.reason = "threshold";
+	Object.defineProperty(f.ctx, "signal", { value: AbortSignal.abort(), configurable: true });
+	assert.equal(f.event.signal.aborted, false, "必须覆盖两种取消信号尚未同步的窗口");
+	assert.deepEqual(await f.handlers.get("session_before_compact")!(f.event, f.ctx), { cancel: true });
+	assert.equal(f.counts().aborts, 0, "不能再次模拟用户取消");
+});
+
+test("重算剩余限额拒绝畸形数值，零请求或截止时不再发起摘要", async () => {
+	for (const limits of [{ maxRequests: Number.NaN, deadline: 1000 }, { maxRequests: -1, deadline: 1000 }, { maxRequests: 1.5, deadline: 1000 }, { maxRequests: 1, deadline: Number.POSITIVE_INFINITY }]) {
+		const f = fixture();
+		const out = await runCompaction({ ...f.input, limits });
+		assert.equal(out.kind, "failed");
+		if (out.kind === "failed") assert.match(out.error, /剩余资源限额/);
+	}
+	for (const limits of [{ maxRequests: 0, deadline: 1000 }, { maxRequests: 3, deadline: 0 }]) {
+		const f = fixture();
+		const out = await runCompaction({ ...f.input, fault: undefined, limits });
+		assert.equal(out.kind, "failed");
+		if (out.kind === "failed") assert.equal(out.stats?.requests, 0, "耗尽限额不能再请求模型");
+	}
+});
+
 for (const method of ["getSessionId", "getLeafId", "getSessionFile", "getSessionDir", "getBranch", "buildSessionProjection"]) {
 	test(`缺失 sessionManager.${method} 时所有入口安全拒绝，不由 runner 吞异常`, async () => {
 		const f = fixture();

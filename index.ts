@@ -14,9 +14,9 @@ import { randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { VERSION, type ExtensionAPI, type ExtensionContext, type SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { applyBaseline, applyDensity, computeBudget, countAutoCompactions, freshModelState, isOwnCompaction, type ModelState } from "./budget.ts";
+import { applyBaseline, applyDensity, computeBudget, countAutoCompactions, estC, freshModelState, isOwnCompaction, type ModelState } from "./budget.ts";
 import { handoffDir, handoffDoc, nextHandoffPath, removeHandoffsBefore, writeHandoffFile } from "./handoff.ts";
-import { chooseModel, initialFEst, isVirtual, modelKey, requestFromEvent, runCompaction, virtualWindow, type OwnDetails } from "./compact.ts";
+import { chooseModel, fullText, initialFEst, isVirtual, modelKey, MAX_REQUESTS, MAX_WALL_MS, requestFromEvent, runCompaction, virtualWindow, type OwnDetails } from "./compact.ts";
 import { applyEdits, contentText, findInvalidation, messageText, toolCalls, type RawEntry } from "./edits.ts";
 import { extractPack, type RecoveryRecord } from "./pack.ts";
 import { capRecall, recallById, recallByQuery, validRecoveryRecords, type RecallDoc } from "./recall.ts";
@@ -24,6 +24,7 @@ import * as rec from "./recovery.ts";
 import { redact, redactDeep } from "./redact.ts";
 import { compactionSettingsFor, MAX_RECORDS, parseConfig, restoreState, STATE_TYPE, freshState, type CompactionRecord, type Config, type PersistedState, type R5Reason } from "./state.ts";
 import { checkedProjection, hostBoundary, requireSession, requireSummaryHost } from "./host-contract.ts";
+import { captureSnapshot, leafIsAncestor, sameInput, samePlanningIdentity, type InputSnapshot } from "./stability.ts";
 
 const RESET_TYPE = "smart-compact-reset";
 const INVALIDATED_TYPE = "smart-compact-invalidated";
@@ -577,6 +578,8 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 
 	on("session_before_compact", async (event, ctx) => {
 		if (!summaryEnabled() || event.signal.aborted) return undefined;
+		// 主请求取消与压缩取消可能尚未同步，明确拦截原生摘要回退，但不再次中止或重启主请求。
+		if (ctx.signal?.aborted) return { cancel: true };
 		const r = rt(ctx);
 		const stop = (reason: R5Reason | null) => {
 			// threshold 与 overflow 两级都失败或被禁止时让运行真正停下：handler 内中止一次，下一个 turn_start 再中止一次（方案 F49）。
@@ -591,13 +594,12 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 			return { cancel: true };
 		}
 		r.inflight = true;
-		const leaf = ctx.sessionManager.getLeafId();
 		let batchNonce: string | null = null;
 		try {
 			const branch = event.branchEntries as unknown as RawEntry[];
 			rec.scanAndAdvance(r.scan, branch);
 			batchNonce = deps.randomId();
-			const batch = rec.takeBatch(r.scan, batchNonce);
+			let batch = rec.takeBatch(r.scan, batchNonce);
 			if (!batch) batchNonce = null;
 			r.batchNonce = batchNonce;
 
@@ -607,7 +609,7 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 			if (r5?.reason === "count" && auto) return stop(null);
 
 			const invalid = findInvalidation(branch);
-			const rebuild = !!invalid || r5?.reason === "history";
+			let rebuild = !!invalid || r5?.reason === "history";
 			const choice = chooseModel(ctx, branch, config);
 			if (!choice) {
 				if (!auto) {
@@ -634,9 +636,66 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 				const data = extractPack({ entries: applyEdits(branch), keptIds: new Set(), omitted: batch.records, handoffPath });
 				writeHandoff(ctx, r, handoffPath, handoffDoc("smart-compact 交接文档（溢出恢复，压缩前）", undefined, data, { reason: event.reason }));
 			}
-			const nonce = deps.randomId();
-			const out = await runCompaction({ event: requestFromEvent(event), ctx, config, choice, modelState: ms, fEst, omitted: batch, rebuild, handoffPath, nonce, fault: fault(), now: deps.now });
-			if (event.signal.aborted) return undefined;
+			const snapshot = (currentBranch: RawEntry[]): InputSnapshot => captureSnapshot(ctx, currentBranch, choice, { settings: event.preparation.settings, T, fEst, modelState: ms, config, omitted: batch, rebuild }, activeTools());
+			let current = branchOf(ctx);
+			let before = snapshot(current);
+			const deadline = deps.now() + MAX_WALL_MS;
+			let requestsUsed = 0;
+			let replans = 0;
+			let accumulated = { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 as number | null, calls: 0, chunks: 0 };
+			let finalTokensBefore = event.preparation.tokensBefore;
+			let out: Awaited<ReturnType<typeof runCompaction>>;
+			let nonce = deps.randomId();
+			while (true) {
+				if (event.signal.aborted) return undefined;
+				if (deps.now() >= deadline || requestsUsed >= MAX_REQUESTS) return auto ? stop("failed") : { cancel: true };
+				// 首次保留宿主的用量口径，重算时估算完整当前投影，不能漏掉已有摘要。
+				const currentTokensBefore = replans === 0 ? event.preparation.tokensBefore : Math.ceil(estC(fullText(ctx.sessionManager.buildSessionProjection().messages)));
+				finalTokensBefore = currentTokensBefore;
+				const compactEvent = requestFromEvent({ ...event, branchEntries: current } as typeof event);
+				compactEvent.tokensBefore = currentTokensBefore;
+				compactEvent.fallbackFirstKept = current.some((entry) => entry.id === compactEvent.fallbackFirstKept) ? compactEvent.fallbackFirstKept : before.projection[0]?.id ?? "";
+				out = await runCompaction({ event: compactEvent, ctx, config, choice, modelState: ms, fEst, omitted: batch, rebuild, handoffPath, nonce, fault: fault(), now: deps.now, limits: { maxRequests: MAX_REQUESTS - requestsUsed, deadline } });
+				const stats = out.kind === "ok" ? out.result.details.stats : out.kind === "failed" ? out.stats : undefined;
+				if (stats) {
+					requestsUsed += stats.requests;
+					for (const key of ["requests", "input", "output", "cacheRead", "cacheWrite", "calls", "chunks"] as const) accumulated[key] += stats[key];
+					if (stats.cost === null) accumulated.cost = null;
+					else if (accumulated.cost !== null) accumulated.cost += stats.cost;
+				}
+				if (event.signal.aborted) return undefined;
+				if (ctx.signal?.aborted) return { cancel: true };
+				const latest = branchOf(ctx);
+				const after = snapshot(latest);
+				if (!leafIsAncestor(latest, before.leafId)) {
+					tell(ctx, "smart-compact：压缩期间切换了会话分支，结果已丢弃。", "warning");
+					return auto ? stop("failed") : { cancel: true };
+				}
+				if (sameInput(before, after)) break;
+				if (!samePlanningIdentity(before, after)) {
+					tell(ctx, "smart-compact：压缩期间模型、工具、预算或会话身份发生变化，结果已丢弃。", "warning");
+					return auto ? stop("failed") : { cancel: true };
+				}
+				if (requestsUsed >= MAX_REQUESTS || replans >= MAX_REQUESTS || deps.now() >= deadline) return auto ? stop("failed") : { cancel: true };
+				replans++;
+				rec.scanAndAdvance(r.scan, latest);
+				if (r.scan.collected.length) {
+					const known = new Set(batch?.records.map((record) => record.editId) ?? []);
+					const added = r.scan.collected.splice(0).filter((record) => !known.has(record.editId));
+					if (!batch && added.length) {
+						batch = { nonce: batchNonce ?? deps.randomId(), records: [] };
+						batchNonce = batch.nonce;
+						r.scan.batches.push(batch);
+						r.batchNonce = batchNonce;
+					}
+					batch?.records.push(...added);
+				}
+				current = latest;
+				rebuild = !!findInvalidation(current) || r5?.reason === "history";
+				// 恢复批次与重建标志属于新尝试输入，合并后重新取快照，不能复用旧尝试的预算身份。
+				before = snapshot(current);
+				nonce = deps.randomId();
+			}
 			if (out.kind === "invariant") return stop("baseline");
 			if (out.kind === "failed") {
 				writeHandoff(ctx, r, handoffPath, out.handoff ?? "");
@@ -644,16 +703,15 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 				if (!auto) return { cancel: true };
 				return stop("failed");
 			}
-			if (ctx.sessionManager.getLeafId() !== leaf) {
-				tell(ctx, "smart-compact：压缩期间会话发生了变化，结果已丢弃，请重新发送。", "warning");
-				if (event.reason === "threshold") ctx.abort();
-				return { cancel: true };
+			if (requestsUsed > 0) {
+				out.result.details.stats = { ...accumulated, wallMs: deps.now() - (deadline - MAX_WALL_MS), costLabel: accumulated.cost === null ? "未知" : `$${accumulated.cost.toFixed(4)}` };
+				out.result.usage = { input: accumulated.input, output: accumulated.output, cacheRead: accumulated.cacheRead, cacheWrite: accumulated.cacheWrite, totalTokens: accumulated.input + accumulated.output + accumulated.cacheRead + accumulated.cacheWrite, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: accumulated.cost ?? 0 } };
 			}
 			// overflow 与 manual 在下限参数仍不满足不变量时照常压缩，但随后进入 R5（方案 7.3、7.4）。
 			if (!out.result.details.budget.ok && auto) enterR5(ctx, r, "baseline", false);
 			const wrote = writeHandoff(ctx, r, handoffPath, out.handoff);
 			if (!wrote) out.result.details.handoffPath = undefined;
-			r.returned = { nonce, batchNonce, key: choice.key, T, reason: event.reason, tokensBefore: event.preparation.tokensBefore };
+			r.returned = { nonce, batchNonce, key: choice.key, T, reason: event.reason, tokensBefore: finalTokensBefore };
 			return { compaction: out.result };
 		} catch (err) {
 			// 任何异常都不能让 pi 默认摘要接手（方案第 9 节）。

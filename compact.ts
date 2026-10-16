@@ -190,6 +190,8 @@ export interface CompactInput {
 	nonce: string;
 	fault: "main" | "all" | undefined;
 	now: () => number;
+	/** 同次压缩重算共享的剩余请求数和绝对截止时间，时间单位与 now 一致，缺省采用本模块上限。 */
+	limits?: { maxRequests: number; deadline: number };
 }
 
 export type CompactOutcome =
@@ -219,6 +221,7 @@ export async function runCompaction(input: CompactInput): Promise<CompactOutcome
 	try {
 		requireRequest(input.event);
 		requireSummaryHost(input.ctx);
+		if (input.limits && (!Number.isInteger(input.limits.maxRequests) || input.limits.maxRequests < 0 || !Number.isFinite(input.limits.deadline))) throw new Error("压缩剩余资源限额必须为非负整数请求数和有限截止时间");
 		// 宿主以非正 maxTokens 表示未声明输出上限，本次输出仍受 reserveTokens 约束。
 		if (![input.choice.window, input.choice.summaryWindow, input.modelState.c].every((n) => Number.isFinite(n) && n > 0) || !Number.isFinite(input.choice.summaryModel.maxTokens) || !Number.isFinite(input.fEst) || input.fEst < 0) throw new Error("模型窗口或估算预算不符合契约");
 		return await executeCompaction(input);
@@ -325,8 +328,8 @@ async function executeCompaction(input: CompactInput): Promise<CompactOutcome> {
 		userFocus: userFocus ? redact(userFocus) : undefined,
 		previousSummary: prevRedacted,
 		fault,
-		maxRequests: MAX_REQUESTS,
-		deadline: started + MAX_WALL_MS,
+		maxRequests: Math.min(MAX_REQUESTS, input.limits?.maxRequests ?? MAX_REQUESTS),
+		deadline: Math.min(started + MAX_WALL_MS, input.limits?.deadline ?? Number.POSITIVE_INFINITY),
 		now,
 		generate,
 	});
