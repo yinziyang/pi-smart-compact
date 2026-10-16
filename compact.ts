@@ -14,6 +14,7 @@ import { handoffDoc } from "./handoff.ts";
 import { extractPack, renderFull, renderLocal, renderModelData, truncateBytes, type RecoveryRecord } from "./pack.ts";
 import { redact, redactDeep } from "./redact.ts";
 import type { Config } from "./state.ts";
+import { checkedProjection, requireRequest, requireSummaryHost } from "./host-contract.ts";
 
 /** 摘要调用的瞬时错误重试策略（方案 F44）。 */
 const RETRY = { enabled: true, maxRetries: 2, baseDelayMs: 2000 };
@@ -215,6 +216,18 @@ function sumUsage(stats: SummaryStats): Usage {
 
 /** 执行一次压缩的主流程。不抛异常：内部错误转成 failed。 */
 export async function runCompaction(input: CompactInput): Promise<CompactOutcome> {
+	try {
+		requireRequest(input.event);
+		requireSummaryHost(input.ctx);
+		// 宿主以非正 maxTokens 表示未声明输出上限，本次输出仍受 reserveTokens 约束。
+		if (![input.choice.window, input.choice.summaryWindow, input.modelState.c].every((n) => Number.isFinite(n) && n > 0) || !Number.isFinite(input.choice.summaryModel.maxTokens) || !Number.isFinite(input.fEst) || input.fEst < 0) throw new Error("模型窗口或估算预算不符合契约");
+		return await executeCompaction(input);
+	} catch (error) {
+		return { kind: "failed", error: `宿主契约或压缩执行失败：${redact(error instanceof Error ? error.message : String(error))}`, handoff: undefined };
+	}
+}
+
+async function executeCompaction(input: CompactInput): Promise<CompactOutcome> {
 	const { event, ctx, config, choice, modelState, fEst, omitted, rebuild, handoffPath, nonce, fault, now } = input;
 	const started = now();
 	const settings = event.settings;
@@ -228,11 +241,7 @@ export async function runCompaction(input: CompactInput): Promise<CompactOutcome
 	const c = modelState.c;
 
 	// 投影条目：已应用 compaction 与 context_edit，去掉 compaction 条目与 system 消息。
-	const projected = ctx.sessionManager
-		.buildSessionProjection()
-		.entries.filter((pe) => pe.sourceEntry.type !== "compaction")
-		.map((pe) => ({ id: pe.sourceEntry.id, messages: pe.messages.filter((m) => m.role !== "system") }))
-		.filter((pe) => pe.messages.length > 0);
+	const projected = checkedProjection(ctx, branch);
 	// 保留区会原样发给模型，必须按完整内容估算；serializeConversation 会把工具结果截到 2000 字符（方案 F9），用它估算会严重低估读文件等大块结果。
 	const cutEntries: CutEntry[] = projected.map((pe) => ({ id: pe.id, roles: pe.messages.map((m) => m.role), est: estC(fullText(pe.messages), c) }));
 	const cut = chooseCut(cutEntries, budget.K, event.fallbackFirstKept);

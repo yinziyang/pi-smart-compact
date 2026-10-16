@@ -2,7 +2,7 @@
 //
 // 每个会话一份运行时状态（按 sessionId 保存），父会话与 pi-subagents 子会话互不影响。
 // 关键不变量：
-//   - session_before_compact 在任何路径上都不返回空（signal 已取消、关闭开关或 pi 版本不符除外），因为空结果会让 pi 默认摘要接手，而默认摘要没有长度上限（方案 F45）。
+//   - session_before_compact 在任何路径上都不返回空（signal 已取消或关闭开关除外），因为空结果会让 pi 默认摘要接手，而默认摘要没有长度上限（方案 F45）。
 //   - session_before_compact 内不追加会话条目；状态在 session_compact、session_compact_failed 与 agent_settled 中持久化（方案 7.4）。
 //   - 处于 R5 时，普通输入被拦截，每个回合开始时中止，只有 /compact 与 /smart-compact 可用（方案 7.4 R5）。
 //   - context handler 不抛异常：出错时把消息中的压缩摘要替换为固定短通知。
@@ -23,9 +23,8 @@ import { capRecall, recallById, recallByQuery, validRecoveryRecords, type Recall
 import * as rec from "./recovery.ts";
 import { redact, redactDeep } from "./redact.ts";
 import { compactionSettingsFor, MAX_RECORDS, parseConfig, restoreState, STATE_TYPE, freshState, type CompactionRecord, type Config, type PersistedState, type R5Reason } from "./state.ts";
+import { checkedProjection, hostBoundary, requireSession, requireSummaryHost } from "./host-contract.ts";
 
-/** 已验证的 pi 版本；不一致时不接管摘要（方案风险 2）。 */
-export const VERIFIED_PI_VERSION = "1.2.0";
 const RESET_TYPE = "smart-compact-reset";
 const INVALIDATED_TYPE = "smart-compact-invalidated";
 const STATUS_KEY = "smart-compact";
@@ -125,7 +124,7 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		return parseConfig(text);
 	};
 	let { config, problems: configProblems } = loadConfig();
-	const takeover = () => deps.env.PI_SMART_COMPACT_SUMMARY !== "off" && deps.piVersion === VERIFIED_PI_VERSION;
+	const summaryEnabled = () => deps.env.PI_SMART_COMPACT_SUMMARY !== "off";
 	const fault = (): "main" | "all" | undefined => (deps.env.PI_SMART_COMPACT_FAULT === "main" || deps.env.PI_SMART_COMPACT_FAULT === "all" ? deps.env.PI_SMART_COMPACT_FAULT : undefined);
 
 	const rt = (ctx: ExtensionContext): Runtime => {
@@ -139,9 +138,35 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 	};
 	/** 有界面时用通知，没有界面（print、RPC 模式）时写诊断日志，保证失败原因总能被看到。 */
 	const tell = (ctx: ExtensionContext, text: string, level: "info" | "warning" | "error" = "warning") => {
-		if (ctx.hasUI) ctx.ui.notify(text, level);
-		else deps.log(`[smart-compact] ${level}: ${text}`);
+		try {
+			if (ctx.hasUI) {
+				ctx.ui.notify(text, level);
+				return;
+			}
+		} catch {
+			// UI 契约缺失时仍通过日志报告，不能因通知失败而放行默认摘要。
+		}
+		deps.log(`[smart-compact] ${level}: ${text}`);
 	};
+	const host = hostBoundary(pi, summaryEnabled, (ctx, text, automatic) => {
+		if (automatic) {
+			try {
+				requireSession(ctx);
+				const r = rt(ctx);
+				// 能力检查提前失败也属于自动压缩失败，沿用 R5，但只能在后续安全事件持久化。
+				if (!r.state.r5) {
+					r.state.r5 = { reason: "failed", since: new Date(deps.now()).toISOString() };
+					r.dirty = true;
+				}
+				r.abortNextTurn = true;
+				updateStatus(ctx, r);
+			} catch {
+				// 核心会话契约也失效时不能安全保存状态，边界适配器仍会取消操作并中止。
+			}
+		}
+		tell(ctx, `${text}宿主版本：${deps.piVersion}。`, "error");
+	});
+	const on = host.on;
 	const notifyOnce = (ctx: ExtensionContext, r: Runtime, key: string, text: string, level: "info" | "warning" | "error" = "warning") => {
 		if (r.notified.has(key)) return;
 		r.notified.add(key);
@@ -273,22 +298,21 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		return pi.getAllTools().filter((t) => active.has(t.name));
 	};
 
-	pi.on("session_start", (_e, ctx) => {
+	on("session_start", (_e, ctx) => {
 		({ config, problems: configProblems } = loadConfig());
 		const r = restore(ctx);
 		for (const p of configProblems) notifyOnce(ctx, r, `config:${p}`, `smart-compact：${p}`);
-		if (deps.piVersion !== VERIFIED_PI_VERSION) notifyOnce(ctx, r, "version", `smart-compact：pi 版本 ${deps.piVersion} 未经验证（已验证 ${VERIFIED_PI_VERSION}），本扩展不接管压缩摘要。`);
 		precheck(ctx, r);
 	});
-	pi.on("session_tree", (_e, ctx) => {
+	on("session_tree", (_e, ctx) => {
 		precheck(ctx, restore(ctx));
 	});
 	// 注册表刷新或鉴权变化后重新计算虚拟模型窗口（方案 7.2）。
-	pi.on("before_agent_start", (_e, ctx) => {
+	on("before_agent_start", (_e, ctx) => {
 		precheck(ctx, rt(ctx));
 	});
 
-	pi.on("model_select", (e, ctx) => {
+	on("model_select", (e, ctx) => {
 		const r = rt(ctx);
 		const changed = !e.previousModel || modelKey(e.model) !== modelKey(e.previousModel);
 		// 切换模型后，新模型的响应不能作为旧模型压缩后的基线样本（方案 7.1 按物理模型分开保存）。
@@ -297,14 +321,14 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		precheck(ctx, r);
 	});
 
-	pi.on("input", (e, ctx) => {
+	on("input", (e, ctx) => {
 		const r = rt(ctx);
 		if (!r.state.r5 || allowedInR5(e.text)) return { action: "continue" };
 		tell(ctx, `自动压缩已停止：${R5_TEXT[r.state.r5.reason]}。输入未发送。可执行 /compact、/smart-compact reset，或用交接文档开新会话。`, "error");
 		return { action: "handled" };
 	});
 
-	pi.on("turn_start", (_e, ctx) => {
+	on("turn_start", (_e, ctx) => {
 		const r = rt(ctx);
 		if (r.abortNextTurn || r.state.r5) {
 			r.abortNextTurn = false;
@@ -390,7 +414,7 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		const inv = detectInvalidation(ctx, r);
 		if (!inv) return r.state.r5?.reason === "history" ? INVALID_NOTICE : null;
 		if (r.pendingDraft?.forId === inv.compactionId) return r.pendingDraft.draft.type === "compaction" ? r.pendingDraft.draft.summary : INVALID_NOTICE;
-		if (r.rebuiltFor === inv.compactionId || !takeover()) {
+		if (r.rebuiltFor === inv.compactionId || !summaryEnabled()) {
 			if (!r.state.r5) enterR5(ctx, r, "history");
 			return INVALID_NOTICE;
 		}
@@ -405,13 +429,15 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		return out.type === "compaction" ? out.summary : INVALID_NOTICE;
 	};
 
-	pi.on("context", async (e, ctx) => {
+	on("context", async (e, ctx) => {
 		const r = rt(ctx);
 		const replace = (messages: AgentMessage[], summary: string) => messages.map((m) => (m.role === "compactionSummary" ? { ...m, summary } : m));
 		try {
 			const summary = await handleInvalidation(ctx, r, ctx.signal ?? new AbortController().signal);
 			return summary === null ? undefined : { messages: replace(e.messages, summary) };
-		} catch {
+		} catch (err) {
+			tell(ctx, `smart-compact：上下文重建失败：${redact(err instanceof Error ? err.message : String(err))}。当前请求已中止。`, "error");
+			ctx.abort();
 			return { messages: replace(e.messages, INVALID_NOTICE) };
 		}
 	});
@@ -426,12 +452,12 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		return entries;
 	};
 
-	pi.on("turn_end", (_e, ctx) => {
+	on("turn_end", (_e, ctx) => {
 		const entries = takeBoundary(rt(ctx));
 		return entries.length ? { entries } : undefined;
 	});
 
-	pi.on("message_end", (e, ctx) => {
+	on("message_end", (e, ctx) => {
 		const m = e.message as { role?: string; stopReason?: string; usage?: Record<string, unknown>; provider?: string; model?: string; toolName?: string; content?: unknown };
 		// recall_history 的最终结果在落盘前统一脱敏并裁剪：pi 的参数校验错误会在 execute 之前生成并回显完整参数，绕过工具内部的处理（方案第 6 节）。
 		if (m.role === "toolResult" && m.toolName === "recall_history") {
@@ -491,7 +517,7 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 	});
 
 	// 恢复省略记录的扫描状态机（方案第 8 节）。
-	pi.on("agent_end", (e, ctx) => {
+	on("agent_end", (e, ctx) => {
 		const r = rt(ctx);
 		const branch = branchOf(ctx);
 		rec.onAgentEnd(r.scan, branch);
@@ -519,8 +545,8 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 			r.windowId = null;
 		}
 	};
-	pi.on("agent_start", (_e, ctx) => closeWindow(ctx));
-	pi.on("agent_before_settle", async (_e, ctx) => {
+	on("agent_start", (_e, ctx) => closeWindow(ctx));
+	on("agent_before_settle", async (_e, ctx) => {
 		closeWindow(ctx);
 		const r = rt(ctx);
 		// 运行的最后一个回合之后才出现的失效编辑，在这里重建；运行已结束，用独立的中止信号，资源上限仍由 MAX_REQUESTS 与 MAX_WALL_MS 约束。
@@ -538,7 +564,7 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		if (batch) pi.appendEntry(rec.RECOVERY_TYPE, { version: rec.RECOVERY_VERSION, nonce: batch.nonce, createdAt: new Date(deps.now()).toISOString(), records: batch.records });
 	};
 
-	pi.on("agent_settled", (_e, ctx) => {
+	on("agent_settled", (_e, ctx) => {
 		const r = rt(ctx);
 		rec.scan(r.scan, branchOf(ctx));
 		r.scan.windowStart = null;
@@ -549,8 +575,8 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		persist(r);
 	});
 
-	pi.on("session_before_compact", async (event, ctx) => {
-		if (!takeover() || event.signal.aborted) return undefined;
+	on("session_before_compact", async (event, ctx) => {
+		if (!summaryEnabled() || event.signal.aborted) return undefined;
 		const r = rt(ctx);
 		const stop = (reason: R5Reason | null) => {
 			// threshold 与 overflow 两级都失败或被禁止时让运行真正停下：handler 内中止一次，下一个 turn_start 再中止一次（方案 F49）。
@@ -639,7 +665,7 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		}
 	});
 
-	pi.on("session_compact", (event, ctx) => {
+	on("session_compact", (event, ctx) => {
 		const r = rt(ctx);
 		const entry = event.compactionEntry as unknown as RawEntry;
 		const details = entry.details as Partial<OwnDetails> | undefined;
@@ -669,10 +695,10 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 			if (mine.batchNonce) writeRecovery(r, mine.batchNonce);
 		} else if (r.batchNonce) writeRecovery(r, r.batchNonce);
 		persist(r);
-		if (!isOwnCompaction(entry) && takeover()) notifyOnce(ctx, r, "foreign", "smart-compact：检测到不是本扩展生成的压缩。");
+		if (!isOwnCompaction(entry) && summaryEnabled()) notifyOnce(ctx, r, "foreign", "smart-compact：检测到不是本扩展生成的压缩。");
 	});
 
-	pi.on("session_compact_failed", (_e, ctx) => {
+	on("session_compact_failed", (_e, ctx) => {
 		const r = rt(ctx);
 		r.returned = null;
 		if (r.batchNonce) writeRecovery(r, r.batchNonce);
@@ -708,15 +734,17 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 		parameters: Type.Object({ query: Type.String(), entryId: Type.Optional(Type.String()) }),
 		annotations: { readOnlyHint: true },
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const docs = recallDocs(ctx);
-			const text = capRecall(redact(params.entryId ? (recallById(docs, params.entryId) ?? `找不到 entryId=${params.entryId}，或该记录已被删除。`) : recallByQuery(docs, params.query)));
-			return { content: [{ type: "text", text }], details: undefined };
+			return host.run(ctx, () => {
+				const docs = recallDocs(ctx);
+				const text = capRecall(redact(params.entryId ? (recallById(docs, params.entryId) ?? `找不到 entryId=${params.entryId}，或该记录已被删除。`) : recallByQuery(docs, params.query)));
+				return { content: [{ type: "text" as const, text }], details: undefined };
+			}, { content: [{ type: "text" as const, text: "smart-compact：宿主契约不兼容，无法安全读取历史。" }], details: undefined });
 		},
 	});
 
 	pi.registerCommand("smart-compact", {
 		description: "smart-compact：status 查看状态，reset 解除停止状态并清零自动压缩次数",
-		handler: async (args, ctx) => {
+		handler: async (args, ctx) => host.run(ctx, () => {
 			const r = rt(ctx);
 			const sub = args.trim().split(/\s+/)[0] || "status";
 			if (sub === "reset") {
@@ -733,14 +761,19 @@ export function smartCompact(pi: ExtensionAPI, deps: Deps): void {
 				return;
 			}
 			const branch = branchOf(ctx);
+			if (summaryEnabled()) {
+				requireSummaryHost(ctx);
+				checkedProjection(ctx, branch);
+			}
 			const lines = [
-				`接管摘要：${takeover() ? "是" : "否"}`,
+				`接管摘要：${summaryEnabled() ? "已启用（当前能力与投影检查通过）" : "否（用户关闭）"}`,
+				`宿主版本：${deps.piVersion}（仅诊断，时序语义由 SDK 回归验证）`,
 				`停止状态：${r.state.r5 ? `${R5_TEXT[r.state.r5.reason]}（${r.state.r5.since}）` : "无"}`,
 				`本会话自动压缩次数：${countAutoCompactions(branch)} / ${config.maxAutoCompactions}`,
 				...Object.entries(r.state.models).map(([k, s]) => `${k}：预算级别 ${s.budgetLevel}，连续过密 ${s.dense}，c=${s.c.toFixed(2)}，F_est=${s.fEst ?? "未知"}`),
 			];
 			tell(ctx, lines.join("\n"), "info");
-		},
+		}, undefined),
 	});
 }
 

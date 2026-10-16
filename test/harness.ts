@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { type AssistantMessage, fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, type ExtensionFactory, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { PACK_CLOSE, PACK_OPEN } from "../pack.ts";
-import { realDeps, smartCompact, VERIFIED_PI_VERSION } from "../index.ts";
+import { realDeps, smartCompact } from "../index.ts";
 
 export type Session = Awaited<ReturnType<typeof createAgentSession>>["session"];
 
@@ -39,6 +39,8 @@ export interface Request {
 }
 
 export interface RunOptions {
+	/** 只替换版本诊断字符串，缺省使用实际 SDK 版本，不伪装成旧的已验证版本。 */
+	piVersion?: string;
 	settings?: Record<string, unknown>;
 	contextWindow?: number;
 	config?: Record<string, unknown>;
@@ -137,7 +139,7 @@ export async function run(o: RunOptions): Promise<RunResult & { handoffTexts: st
 			}),
 		);
 		const env = { ...process.env, ...(o.env ?? {}) };
-		const ext: ExtensionFactory = (pi) => smartCompact(pi, { ...realDeps(), agentDir, env, piVersion: VERIFIED_PI_VERSION, log: (l) => logs.push(l) });
+		const ext: ExtensionFactory = (pi) => smartCompact(pi, { ...realDeps(), agentDir, env, ...(o.piVersion === undefined ? {} : { piVersion: o.piVersion }), log: (l) => logs.push(l) });
 		const loader = new DefaultResourceLoader({ cwd, agentDir, extensionFactories: [ext, ...(o.factories ?? [])] });
 		await loader.reload();
 		const { session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model, resourceLoader: loader, sessionManager: SessionManager.create(cwd, sessionsDir) });

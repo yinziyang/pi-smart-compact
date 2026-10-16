@@ -13,9 +13,11 @@ pi install git:https://github.com/yinziyang/pi-smart-compact.git
 安装后重启 pi，新开的会话即生效。
 扩展运行时只依赖 pi 自带的包，不需要额外安装依赖。
 
-必须用 `pi install` 安装（写进 `settings.json` 的 `packages`），pi-subagents 的子会话才会加载它；用 `-e` 临时加载时子会话不加载。
+长期使用建议用 `pi install` 写入 `settings.json` 的 `packages`，让 pi-subagents 的子会话也能发现它。
+仅用 `-e` 临时加载的入口不会自动传给子会话。
+本地组合验收应在隔离设置的 `extensions` 中显式加入所有参与插件的绝对路径，同时为父进程逐一指定 `-e`，避免子会话混入旧安装副本。
 
-更新与卸载：
+更新与卸载命令如下。
 
 ```bash
 pi update --extensions
@@ -25,7 +27,7 @@ pi remove git:https://github.com/yinziyang/pi-smart-compact.git
 ## 必需的配置：打开 pi 的自动压缩
 
 扩展只负责「压成什么样」，「什么时候压」仍由 pi 自带的触发机制决定。
-所以必须在 `~/.pi/agent/settings.json` 中打开自动压缩：
+所以必须在 `~/.pi/agent/settings.json` 中打开自动压缩。
 
 ```json
 "compaction": {
@@ -35,9 +37,15 @@ pi remove git:https://github.com/yinziyang/pi-smart-compact.git
 }
 ```
 
-- `enabled`：必须为 `true`。为 `false` 时 pi 不会自动压缩，溢出恢复也会关闭，扩展不会被调用，只剩手动 `/compact` 可用。
-- `reserveTokens`：触发余量，建议 32768。触发点等于模型原生窗口减去它，例如 272k 的模型约在 23.9 万 token 时压缩，1M 的模型约在 96.7 万 token 时压缩。pi 的缺省值 16384 留给单次回复的余量偏小。
-- `keepRecentTokens`：压缩后最多保留的近期原文，pi 的缺省值就是 20000。扩展会按窗口大小再算一个可能更小的值，两者取小。
+- `enabled`：必须为 `true` 才会自动压缩。
+  为 `false` 时以下自动功能停用，但仍可用手动 `/compact`。
+  - 阈值自动压缩。
+  - 溢出自动恢复。
+- `reserveTokens`：触发余量，建议 32768。
+  触发点等于模型原生窗口减去它，例如 272k 的模型约在 23.9 万 token 时压缩，1M 的模型约在 96.7 万 token 时压缩。
+  pi 的缺省值 16384 留给单次回复的余量偏小。
+- `keepRecentTokens`：压缩后最多保留的近期原文，pi 的缺省值就是 20000。
+  扩展会按窗口大小再算一个可能更小的值，两者取小。
 
 需要让某个模型提前压缩时，用 pi 原生的 `compaction.modelOverrides` 为它单独设置更大的 `reserveTokens`。
 
@@ -49,11 +57,11 @@ pi remove git:https://github.com/yinziyang/pi-smart-compact.git
 
 ## 压缩策略
 
-压缩后的上下文由三部分组成：
+压缩后的上下文由以下三部分组成。
 
 1. 近期原文：保留最近一段对话原文，不做摘要。
 2. 叙述摘要：更早的内容压成六节结构（目标、约束与偏好、进度、关键决策、下一步、关键上下文），真实 token 有硬上限（最多 8192）。
-3. 压缩包：由扩展确定性生成，附在摘要后面，有字节硬上限：
+3. 压缩包：由扩展确定性生成，附在摘要后面，并按字节硬上限保留以下内容。
    - 验证记录：测试、构建、lint 等命令与结果。
    - 最近失败：最近 3 次出错的工具结果原文尾部。
    - 用户原话：最早一条（通常是任务的原始需求）优先保留，其余按时间倒序。
@@ -64,7 +72,7 @@ pi remove git:https://github.com/yinziyang/pi-smart-compact.git
 完整、未裁剪的版本另写成交接文档，可以用它开新会话。
 摘要、交接文档与召回结果都会对密钥脱敏。
 
-防止反复压缩：
+以下规则用于防止反复压缩。
 
 - 摘要与压缩包都有硬上限，目标是压缩后的上下文不超过触发点的 55%。
 - 实测压缩后上下文仍超过这个比例，或两次压缩间隔过短时，逐级收紧预算。
@@ -74,7 +82,8 @@ pi remove git:https://github.com/yinziyang/pi-smart-compact.git
 ## 命令
 
 - `/smart-compact status`（或只输入 `/smart-compact`）：查看是否接管压缩、是否处于停止状态、本会话自动压缩次数，以及各模型的预算级别与估算数据。
-- `/smart-compact reset`：解除停止状态，清零自动压缩次数，恢复预算级别。历史被其他扩展修改、且自动重建失败导致的停止不能用它解除，只能用 `/compact` 手动重建或开新会话。
+- `/smart-compact reset`：解除停止状态，清零自动压缩次数，恢复预算级别。
+  历史被其他扩展修改、且自动重建失败导致的停止不能用它解除，只能用 `/compact` 手动重建或开新会话。
 
 `/smart-compact` 不触发压缩，只管理扩展的状态；压缩用 `/compact`。
 
@@ -104,7 +113,7 @@ pi remove git:https://github.com/yinziyang/pi-smart-compact.git
 
 只把确认过分词器的模型加入后两项。
 
-环境变量：
+环境变量如下。
 
 - `PI_SMART_COMPACT_SUMMARY=off`：不接管压缩摘要，恢复 pi 默认行为，`recall_history` 仍然可用。
 - `PI_SMART_COMPACT_FAULT=main|all`：仅用于测试，让主路径或两级生成都失败。
@@ -116,7 +125,11 @@ pi remove git:https://github.com/yinziyang/pi-smart-compact.git
 
 ## 兼容性与限制
 
-- 已验证的 pi 版本为 1.2.0。pi 版本不同时，扩展自动不接管压缩摘要并提示一次，此时 pi 回到默认压缩。
+- 不再把 pi 精确版本号作为接管白名单，版本字符串变化本身不会导致停用。
+- pi 1.2.0 与 1.3.0 均已通过真实 SDK 回归和本地六插件组合的 LUNA 交互验收。
+- 使用前检查实际会话能力，压缩时继续验证事件预算及投影来源与编辑结果。
+- 缺失能力或数据契约不兼容时明确诊断并取消操作，不因检查异常静默交回默认摘要。
+- 当前能力和数据检查通过不代表任意未来宿主的事件时序与持久化语义都已验证。
 - 与 pi-goal、pi-subagents 兼容：子会话按各自模型的窗口压缩；pi-goal 的评估者只读取最新一份摘要，并能读到其中的验证记录。
 - 不要同时安装其他会返回 compaction 的扩展，pi 只采用最后一个结果。
 - 限定了工具的子 agent（例如 Explore、Plan）拿不到 `recall_history`，只能依赖压缩摘要。
@@ -133,5 +146,6 @@ npm run typecheck
 
 - `test/`：单元测试，以及用 pi-ai 的 faux provider 在进程内驱动完整 pi 会话的集成测试，不发生真实调用。
 - `eval/integration.ts`：真实模型集成测试（自动触发、手动压缩、召回、pi-subagents 子会话、pi-goal 多次压缩后达成目标、约束只在摘要中时不误判达成）。
-- `eval/replay.ts`：用真实会话做回放评测，比较不压缩、pi 默认压缩、本扩展与受控回退四组在同样问题上的回答。实测本扩展与 pi 默认压缩的得分在评测噪声范围内持平，压缩后的上下文更小且有硬上限。
+- `eval/replay.ts`：用真实会话做回放评测，比较不压缩、pi 默认压缩、本扩展与受控回退四组在同样问题上的回答。
+  实测本扩展与 pi 默认压缩的得分在评测噪声范围内持平，压缩后的上下文更小且有硬上限。
 - 真实调用都经 `eval/coordinator.ts` 的预算账本与 `eval/budget-guard.ts` 的子进程守卫执行。
